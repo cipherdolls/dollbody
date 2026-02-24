@@ -100,20 +100,22 @@ static bool prov_keyboard(const char *title, const char *placeholder,
 
     prov_reset(lv_color_make(0x10, 0x10, 0x20));
 
+    // Title at y=52: chord ~290px, safe for round bezel
     lv_obj_t *title_lbl = lv_label_create(s_prov_scr);
     lv_label_set_text(title_lbl, title);
     lv_obj_set_style_text_color(title_lbl, lv_color_make(0xFF, 0xFF, 0xFF), 0);
     lv_label_set_long_mode(title_lbl, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(title_lbl, LCD_H_RES - 20);
+    lv_obj_set_width(title_lbl, 250);
     lv_obj_set_style_text_align(title_lbl, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(title_lbl, LV_ALIGN_TOP_MID, 0, 6);
+    lv_obj_align(title_lbl, LV_ALIGN_TOP_MID, 0, 52);
 
+    // Textarea at y=90: chord ~336px, enough for a wide input field
     lv_obj_t *ta = lv_textarea_create(s_prov_scr);
     lv_textarea_set_placeholder_text(ta, placeholder);
     lv_textarea_set_password_mode(ta, password_mode);
     lv_textarea_set_one_line(ta, true);
-    lv_obj_set_width(ta, LCD_H_RES - 60);
-    lv_obj_align(ta, LV_ALIGN_TOP_MID, 0, 34);
+    lv_obj_set_width(ta, 280);
+    lv_obj_align(ta, LV_ALIGN_TOP_MID, 0, 88);
 
     lv_obj_t *kb = lv_keyboard_create(s_prov_scr);
     lv_keyboard_set_textarea(kb, ta);
@@ -156,28 +158,33 @@ static bool prov_network_list(const wifi_ap_info_t *aps, int count,
 
     prov_reset(lv_color_make(0x08, 0x08, 0x20));
 
-    // Title
+    // Title — y=52 from top: chord width ~290px there, safe for round bezel
     lv_obj_t *title = lv_label_create(s_prov_scr);
     lv_label_set_text(title, "Select Network");
     lv_obj_set_style_text_color(title, lv_color_make(0xCC, 0xDD, 0xFF), 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(title, 220);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 52);
 
-    // Scrollable list — centred, leaving room for title
+    // List — 260×265, centered with slight downward offset so it sits below title.
+    // At the top edge (y≈89) chord≈339px and at bottom (y≈353) chord≈289px —
+    // a 260px-wide list clears the bezel at both ends.
     lv_obj_t *list = lv_list_create(s_prov_scr);
-    lv_obj_set_size(list, LCD_H_RES - 50, LCD_V_RES - 70);
-    lv_obj_align(list, LV_ALIGN_CENTER, 0, 14);
+    lv_obj_set_size(list, 260, 265);
+    lv_obj_align(list, LV_ALIGN_CENTER, 0, 15);
     lv_obj_set_style_bg_color(list, lv_color_make(0x10, 0x10, 0x28), 0);
     lv_obj_set_style_border_width(list, 0, 0);
-    lv_obj_set_style_pad_row(list, 2, 0);
+    lv_obj_set_style_pad_all(list, 4, 0);
+    lv_obj_set_style_pad_row(list, 3, 0);
 
     int shown = (count < MAX_NETS) ? count : MAX_NETS;
     for (int i = 0; i < shown; i++) {
         strlcpy(s_ssid_store[i], aps[i].ssid, 33);
 
-        // Label: SSID (truncated) + signal bars + lock indicator
-        char label[52];
+        // "SSID (up to 18 chars)  bars lock"  — fits in ~250px text area
+        char label[48];
         const char *lock = (aps[i].authmode != WIFI_AUTH_OPEN) ? "*" : " ";
-        snprintf(label, sizeof(label), "%-20.20s %s%s",
+        snprintf(label, sizeof(label), "%-18.18s %s%s",
                  aps[i].ssid, rssi_bar(aps[i].rssi), lock);
 
         lv_obj_t *btn = lv_list_add_btn(list, NULL, label);
@@ -240,7 +247,7 @@ void wifi_prov_task_fn(void *pvParameter)
     char pass[64] = "";
     char pw_title[80];
     snprintf(pw_title, sizeof(pw_title), "Password for:\n%.32s", ssid);
-    prov_keyboard(pw_title, "Leave blank if open", true, pass, sizeof(pass));
+    prov_keyboard(pw_title, "Leave blank if open", false, pass, sizeof(pass));
     strlcpy(g_config.password, pass, sizeof(g_config.password));
 
     // ── Step 3: Connect ───────────────────────────────────────────────────────
