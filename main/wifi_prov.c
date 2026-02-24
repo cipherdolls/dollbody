@@ -20,6 +20,7 @@ static lv_obj_t *s_prov_scr = NULL;
 
 // Keyboard result
 static volatile bool s_kb_done = false;
+static volatile bool s_kb_cancelled = false;
 static char s_kb_result[128];
 
 // Network list result
@@ -34,9 +35,11 @@ static void kb_event_cb(lv_event_t *e)
 
     if (code == LV_EVENT_READY) {
         strlcpy(s_kb_result, lv_textarea_get_text(ta), sizeof(s_kb_result));
+        s_kb_cancelled = false;
         s_kb_done = true;
     } else if (code == LV_EVENT_CANCEL) {
         s_kb_result[0] = '\0';
+        s_kb_cancelled = true;
         s_kb_done = true;
     }
 }
@@ -54,6 +57,21 @@ static void rescan_btn_cb(lv_event_t *e)
 {
     s_net_ssid[0] = '\0';
     s_net_done = true;  // empty = trigger rescan
+}
+
+static void kb_cancel_btn_cb(lv_event_t *e)
+{
+    s_kb_result[0] = '\0';
+    s_kb_cancelled = true;
+    s_kb_done = true;
+}
+
+static void kb_continue_btn_cb(lv_event_t *e)
+{
+    lv_obj_t *ta = (lv_obj_t *)lv_event_get_user_data(e);
+    strlcpy(s_kb_result, lv_textarea_get_text(ta), sizeof(s_kb_result));
+    s_kb_cancelled = false;
+    s_kb_done = true;
 }
 
 // ─── Reset the provisioning screen (inside lock) ─────────────────────────────
@@ -93,7 +111,8 @@ static void prov_status(const char *msg, lv_color_t bg)
 static bool prov_keyboard(const char *title, const char *placeholder,
                            bool password_mode, char *out, size_t out_sz)
 {
-    s_kb_done    = false;
+    s_kb_done      = false;
+    s_kb_cancelled = false;
     s_kb_result[0] = '\0';
 
     if (!display_lvgl_lock(-1)) return false;
@@ -109,7 +128,7 @@ static bool prov_keyboard(const char *title, const char *placeholder,
     lv_obj_set_style_text_align(title_lbl, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(title_lbl, LV_ALIGN_TOP_MID, 0, 52);
 
-    // Textarea at y=90: chord ~336px, enough for a wide input field
+    // Textarea at y=88: chord ~336px, wide enough for input
     lv_obj_t *ta = lv_textarea_create(s_prov_scr);
     lv_textarea_set_placeholder_text(ta, placeholder);
     lv_textarea_set_password_mode(ta, password_mode);
@@ -117,6 +136,28 @@ static bool prov_keyboard(const char *title, const char *placeholder,
     lv_obj_set_width(ta, 280);
     lv_obj_align(ta, LV_ALIGN_TOP_MID, 0, 88);
 
+    // Cancel / Continue buttons side-by-side below the textarea
+    lv_obj_t *btn_cancel = lv_btn_create(s_prov_scr);
+    lv_obj_set_size(btn_cancel, 120, 38);
+    lv_obj_align(btn_cancel, LV_ALIGN_TOP_MID, -68, 138);
+    lv_obj_set_style_bg_color(btn_cancel, lv_color_make(0x55, 0x15, 0x15), 0);
+    lv_obj_set_style_bg_color(btn_cancel, lv_color_make(0x80, 0x20, 0x20), LV_STATE_PRESSED);
+    lv_obj_t *lbl_cancel = lv_label_create(btn_cancel);
+    lv_label_set_text(lbl_cancel, "Cancel");
+    lv_obj_center(lbl_cancel);
+    lv_obj_add_event_cb(btn_cancel, kb_cancel_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *btn_cont = lv_btn_create(s_prov_scr);
+    lv_obj_set_size(btn_cont, 120, 38);
+    lv_obj_align(btn_cont, LV_ALIGN_TOP_MID, 68, 138);
+    lv_obj_set_style_bg_color(btn_cont, lv_color_make(0x15, 0x45, 0x15), 0);
+    lv_obj_set_style_bg_color(btn_cont, lv_color_make(0x20, 0x70, 0x20), LV_STATE_PRESSED);
+    lv_obj_t *lbl_cont = lv_label_create(btn_cont);
+    lv_label_set_text(lbl_cont, "Continue");
+    lv_obj_center(lbl_cont);
+    lv_obj_add_event_cb(btn_cont, kb_continue_btn_cb, LV_EVENT_CLICKED, ta);
+
+    // Keyboard at bottom, default size — typing only, buttons above handle submit/cancel
     lv_obj_t *kb = lv_keyboard_create(s_prov_scr);
     lv_keyboard_set_textarea(kb, ta);
     lv_obj_add_event_cb(kb, kb_event_cb, LV_EVENT_READY,  ta);
@@ -128,11 +169,10 @@ static bool prov_keyboard(const char *title, const char *placeholder,
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 
-    bool ok = (s_kb_result[0] != '\0');
     if (out && out_sz > 0) {
         strlcpy(out, s_kb_result, out_sz);
     }
-    return ok;
+    return !s_kb_cancelled;  // true = submitted (empty ok for open network), false = back
 }
 
 // ─── Signal strength indicator ────────────────────────────────────────────────
@@ -221,66 +261,90 @@ void wifi_prov_task_fn(void *pvParameter)
 {
     ESP_LOGI(TAG, "WiFi provisioning start");
 
-    // ── Step 1: Scan and select network ──────────────────────────────────────
-    char ssid[64] = "";
-    while (strlen(ssid) == 0) {
-        prov_status("Scanning for\nWiFi networks...", lv_color_make(0x10, 0x10, 0x40));
+    char ssid[64];
+    char pass[64];
+    char apikey[64];
 
-        wifi_ap_info_t *aps = NULL;
-        int count = wifi_mgr_scan(&aps);
+    for (;;) {
+        // ── Steps 1+2: Scan → select → password ──────────────────────────────
+        ssid[0] = '\0';
+        pass[0] = '\0';
+        for (;;) {
+            // Step 1: Scan and select network
+            ssid[0] = '\0';
+            while (strlen(ssid) == 0) {
+                prov_status("Scanning for\nWiFi networks...", lv_color_make(0x10, 0x10, 0x40));
 
-        if (count == 0) {
-            if (aps) free(aps);
-            prov_status("No networks found\nRetrying...", lv_color_make(0x30, 0x10, 0x10));
-            vTaskDelay(pdMS_TO_TICKS(2000));
-            continue;
-        }
+                wifi_ap_info_t *aps = NULL;
+                int count = wifi_mgr_scan(&aps);
 
-        bool selected = prov_network_list(aps, count, ssid, sizeof(ssid));
-        free(aps);
+                if (count == 0) {
+                    if (aps) free(aps);
+                    prov_status("No networks found\nRetrying...", lv_color_make(0x30, 0x10, 0x10));
+                    vTaskDelay(pdMS_TO_TICKS(2000));
+                    continue;
+                }
 
-        if (!selected) ssid[0] = '\0';  // Rescan
-    }
-    strlcpy(g_config.ssid, ssid, sizeof(g_config.ssid));
+                bool selected = prov_network_list(aps, count, ssid, sizeof(ssid));
+                free(aps);
 
-    // ── Step 2: Password ──────────────────────────────────────────────────────
-    char pass[64] = "";
-    char pw_title[80];
-    snprintf(pw_title, sizeof(pw_title), "Password for:\n%.32s", ssid);
-    prov_keyboard(pw_title, "Leave blank if open", false, pass, sizeof(pass));
-    strlcpy(g_config.password, pass, sizeof(g_config.password));
-
-    // ── Step 3: Connect ───────────────────────────────────────────────────────
-    prov_status("Connecting to WiFi...", lv_color_make(0x10, 0x20, 0x40));
-
-    wifi_mgr_connect(g_config.ssid, g_config.password);
-
-    EventBits_t bits = xEventGroupWaitBits(g_events,
-        EVT_WIFI_GOT_IP | EVT_WIFI_DISCONNECTED, pdFALSE, pdFALSE,
-        pdMS_TO_TICKS(30000));
-
-    if (!(bits & EVT_WIFI_GOT_IP)) {
-        ESP_LOGW(TAG, "WiFi connect failed");
-        prov_status("WiFi Failed\nCheck credentials", lv_color_make(0x40, 0x10, 0x10));
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        memset(g_config.ssid,     0, sizeof(g_config.ssid));
-        memset(g_config.password, 0, sizeof(g_config.password));
-        wifi_prov_task_fn(pvParameter);  // retry
-        vTaskDelete(NULL);
-        return;
-    }
-
-    // ── Step 4: API Key ───────────────────────────────────────────────────────
-    if (strlen(g_config.apikey) == 0) {
-        char apikey[64] = "";
-        while (strlen(apikey) == 0) {
-            if (!prov_keyboard("API Key", "Paste your API key", false,
-                               apikey, sizeof(apikey))) {
-                prov_status("API key required", lv_color_make(0x30, 0x20, 0x00));
-                vTaskDelay(pdMS_TO_TICKS(1000));
+                if (!selected) ssid[0] = '\0';  // Rescan
             }
+
+            // Step 2: Password (Cancel = back to network list)
+            pass[0] = '\0';
+            char pw_title[80];
+            snprintf(pw_title, sizeof(pw_title), "Password for:\n%.32s", ssid);
+            bool pw_ok = prov_keyboard(pw_title, "Enter password", false, pass, sizeof(pass));
+            if (!pw_ok) continue;  // Cancel — back to network selection
+            break;
         }
-        strlcpy(g_config.apikey, apikey, sizeof(g_config.apikey));
+        strlcpy(g_config.ssid,     ssid, sizeof(g_config.ssid));
+        strlcpy(g_config.password, pass, sizeof(g_config.password));
+
+        // ── Step 3: Connect ───────────────────────────────────────────────────
+        prov_status("Connecting to WiFi...", lv_color_make(0x10, 0x20, 0x40));
+
+        wifi_mgr_connect(g_config.ssid, g_config.password);
+
+        EventBits_t bits = xEventGroupWaitBits(g_events,
+            EVT_WIFI_GOT_IP | EVT_WIFI_DISCONNECTED, pdFALSE, pdFALSE,
+            pdMS_TO_TICKS(30000));
+
+        if (!(bits & EVT_WIFI_GOT_IP)) {
+            ESP_LOGW(TAG, "WiFi connect failed");
+            prov_status("WiFi Failed\nCheck credentials", lv_color_make(0x40, 0x10, 0x10));
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            memset(g_config.ssid,     0, sizeof(g_config.ssid));
+            memset(g_config.password, 0, sizeof(g_config.password));
+            continue;  // back to scan
+        }
+
+        // ── Step 4: API Key ───────────────────────────────────────────────────
+        if (strlen(g_config.apikey) == 0) {
+            bool api_done = false;
+            while (!api_done) {
+                apikey[0] = '\0';
+                bool entered = prov_keyboard("API Key", "Paste your API key", false,
+                                             apikey, sizeof(apikey));
+                if (!entered) {
+                    // Cancel: disconnect and go back to WiFi selection
+                    ESP_LOGI(TAG, "API key cancelled — returning to WiFi selection");
+                    wifi_mgr_disconnect();
+                    memset(g_config.ssid,     0, sizeof(g_config.ssid));
+                    memset(g_config.password, 0, sizeof(g_config.password));
+                    break;
+                }
+                if (strlen(apikey) > 0) {
+                    strlcpy(g_config.apikey, apikey, sizeof(g_config.apikey));
+                    api_done = true;
+                }
+                // else: Continue pressed with empty field — loop and ask again
+            }
+            if (!api_done) continue;  // restart outer loop from WiFi scan
+        }
+
+        break;  // all steps complete
     }
 
     // ── Step 5: Save ─────────────────────────────────────────────────────────
