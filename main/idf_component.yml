@@ -1,0 +1,5 @@
+dependencies:
+  espressif/esp_lcd_spd2010: "~1.0.2"
+  espressif/esp_lcd_touch_spd2010: "^1.0.0"
+  lvgl/lvgl: "~8.3.0"
+  espressif/led_strip: "^2.5.3"
