@@ -1,5 +1,6 @@
 #include "led.h"
 #include "board.h"
+#include "events.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -24,8 +25,25 @@ void led_task_fn(void *pvParameter)
         vTaskDelete(NULL);
         return;
     }
-    // Solid dim white — off during deep sleep (power cut)
-    led_strip_set_pixel(strip, 0, 20, 20, 20);
-    led_strip_refresh(strip);
-    vTaskDelete(NULL);
+
+    bool led_on = false;
+    while (1) {
+        bool connected = (xEventGroupGetBits(g_events) & EVT_WIFI_GOT_IP) != 0;
+        if (connected) {
+            // Off when WiFi connected
+            led_strip_clear(strip);
+            led_strip_refresh(strip);
+            led_on = false;
+        } else {
+            // Blink orange when not connected
+            led_on = !led_on;
+            if (led_on) {
+                led_strip_set_pixel(strip, 0, 20, 8, 0);
+            } else {
+                led_strip_clear(strip);
+            }
+            led_strip_refresh(strip);
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
 }

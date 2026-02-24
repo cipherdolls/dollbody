@@ -305,6 +305,11 @@ void wifi_prov_task_fn(void *pvParameter)
         // ── Step 3: Connect ───────────────────────────────────────────────────
         prov_status("Connecting to WiFi...", lv_color_make(0x10, 0x20, 0x40));
 
+        // Clear stale bits (a previous disconnect/cancel leaves EVT_WIFI_DISCONNECTED
+        // set, which would make xEventGroupWaitBits return immediately as "failed")
+        xEventGroupClearBits(g_events,
+            EVT_WIFI_DISCONNECTED | EVT_WIFI_CONNECTED | EVT_WIFI_GOT_IP);
+
         wifi_mgr_connect(g_config.ssid, g_config.password);
 
         EventBits_t bits = xEventGroupWaitBits(g_events,
