@@ -33,6 +33,47 @@ static lv_obj_t *s_label = NULL;
 // MQTT connection indicator (bottom of screen)
 static lv_obj_t *s_mqtt_label = NULL;
 
+// Traffic dots: TX (outgoing, left) and RX (incoming, right) below MQTT label
+static lv_obj_t *s_dot_tx = NULL;
+static lv_obj_t *s_dot_rx = NULL;
+static esp_timer_handle_t s_dim_timer_tx = NULL;
+static esp_timer_handle_t s_dim_timer_rx = NULL;
+
+#define DOT_SIZE 8
+#define DOT_DIM  lv_color_make(0x33, 0x33, 0x33)
+#define DOT_TX   lv_color_make(0x00, 0xFF, 0x88)   // green — outgoing
+#define DOT_RX   lv_color_make(0x00, 0xCC, 0xFF)   // cyan  — incoming
+
+static lv_obj_t *make_dot(lv_obj_t *scr)
+{
+    lv_obj_t *d = lv_obj_create(scr);
+    lv_obj_set_size(d, DOT_SIZE, DOT_SIZE);
+    lv_obj_set_style_radius(d, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(d, DOT_DIM, 0);
+    lv_obj_set_style_bg_opa(d, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(d, 0, 0);
+    lv_obj_set_style_pad_all(d, 0, 0);
+    lv_obj_clear_flag(d, LV_OBJ_FLAG_SCROLLABLE);
+    return d;
+}
+
+// esp_timer callbacks — run in esp_timer task, safe to acquire LVGL mutex
+static void dim_tx_cb(void *arg)
+{
+    if (!s_dot_tx) return;
+    if (!display_lvgl_lock(100)) return;
+    lv_obj_set_style_bg_color(s_dot_tx, DOT_DIM, 0);
+    display_lvgl_unlock();
+}
+
+static void dim_rx_cb(void *arg)
+{
+    if (!s_dot_rx) return;
+    if (!display_lvgl_lock(100)) return;
+    lv_obj_set_style_bg_color(s_dot_rx, DOT_DIM, 0);
+    display_lvgl_unlock();
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // LCD power via PCA9535 IO expander
 // ─────────────────────────────────────────────────────────────────────────────
@@ -274,16 +315,48 @@ void display_set_mqtt_connected(bool connected)
         s_mqtt_label = lv_label_create(scr);
         lv_obj_align(s_mqtt_label, LV_ALIGN_BOTTOM_MID, 0, -48);
         lv_obj_set_style_text_align(s_mqtt_label, LV_TEXT_ALIGN_CENTER, 0);
-        lv_label_set_text(s_mqtt_label, "");
+
+        // Set text first so label has its real size before dots are aligned to it
+        lv_label_set_text(s_mqtt_label, LV_SYMBOL_WIFI " MQTT");
+
+        // TX dot (outgoing) — left, below the label
+        s_dot_tx = make_dot(scr);
+        lv_obj_align_to(s_dot_tx, s_mqtt_label, LV_ALIGN_OUT_BOTTOM_MID, -(DOT_SIZE + 2), 4);
+
+        // RX dot (incoming) — right, below the label
+        s_dot_rx = make_dot(scr);
+        lv_obj_align_to(s_dot_rx, s_mqtt_label, LV_ALIGN_OUT_BOTTOM_MID, (DOT_SIZE + 2), 4);
+
+        // One-shot esp_timers to dim the dots after a pulse
+        esp_timer_create_args_t ta = { .callback = dim_tx_cb, .name = "dot_tx" };
+        esp_timer_create(&ta, &s_dim_timer_tx);
+        esp_timer_create_args_t rb = { .callback = dim_rx_cb, .name = "dot_rx" };
+        esp_timer_create(&rb, &s_dim_timer_rx);
     }
 
-    if (connected) {
-        lv_obj_set_style_text_color(s_mqtt_label, lv_color_make(0x00, 0xFF, 0x88), 0);
-        lv_label_set_text(s_mqtt_label, LV_SYMBOL_WIFI " MQTT");
-    } else {
-        lv_obj_set_style_text_color(s_mqtt_label, lv_color_make(0x66, 0x66, 0x66), 0);
-        lv_label_set_text(s_mqtt_label, LV_SYMBOL_WIFI " MQTT");
-    }
+    lv_obj_set_style_text_color(s_mqtt_label,
+        connected ? lv_color_make(0x00, 0xFF, 0x88)
+                  : lv_color_make(0x66, 0x66, 0x66), 0);
 
     display_lvgl_unlock();
+}
+
+void display_mqtt_tx_pulse(void)
+{
+    if (!s_dot_tx || !s_dim_timer_tx) return;
+    if (!display_lvgl_lock(50)) return;
+    lv_obj_set_style_bg_color(s_dot_tx, DOT_TX, 0);
+    display_lvgl_unlock();
+    esp_timer_stop(s_dim_timer_tx);
+    esp_timer_start_once(s_dim_timer_tx, 300 * 1000);  // 300 ms
+}
+
+void display_mqtt_rx_pulse(void)
+{
+    if (!s_dot_rx || !s_dim_timer_rx) return;
+    if (!display_lvgl_lock(50)) return;
+    lv_obj_set_style_bg_color(s_dot_rx, DOT_RX, 0);
+    display_lvgl_unlock();
+    esp_timer_stop(s_dim_timer_rx);
+    esp_timer_start_once(s_dim_timer_rx, 300 * 1000);  // 300 ms
 }

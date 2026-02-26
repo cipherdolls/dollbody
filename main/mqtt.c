@@ -29,6 +29,7 @@ static void publish_connection_event(const char *status)
     char *payload = cJSON_PrintUnformatted(body);
     cJSON_Delete(body);
     esp_mqtt_client_publish(s_client, "connections", payload, 0, 0, 0);
+    display_mqtt_tx_pulse();
     free(payload);
 }
 
@@ -103,6 +104,7 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
                  "dolls/%s/actionEvents", g_config.doll_id);
 
         if (strcmp(topic, expected) == 0) {
+            display_mqtt_rx_pulse();
             handle_action_event(evt->data, evt->data_len);
         }
         break;
@@ -145,10 +147,11 @@ static void metrics_task(void *arg)
         cJSON_Delete(body);
 
         esp_mqtt_client_publish(s_client, topic, payload, 0, 0, 0);
+        display_mqtt_tx_pulse();
         ESP_LOGD(TAG, "metrics → %s", payload);
         free(payload);
 
-        vTaskDelay(pdMS_TO_TICKS(30000));
+        vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
 
