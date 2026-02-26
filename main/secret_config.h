@@ -2,7 +2,8 @@
 
 // Secrets are injected at build time from environment variables.
 // Copy .env.example to .env, fill in your values, then:
-//   source .env && idf.py build
+//   set -a && source .env && set +a && idf.py build
+// Note: plain `source .env` does NOT export vars to cmake subprocesses.
 
 #ifndef SECRET_SSID
 #define SECRET_SSID       "your_wifi_ssid"
