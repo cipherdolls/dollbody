@@ -30,6 +30,9 @@ static lv_disp_draw_buf_t s_disp_buf;
 // Current status label (on the main screen)
 static lv_obj_t *s_label = NULL;
 
+// MQTT connection indicator (bottom of screen)
+static lv_obj_t *s_mqtt_label = NULL;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // LCD power via PCA9535 IO expander
 // ─────────────────────────────────────────────────────────────────────────────
@@ -251,13 +254,36 @@ void display_set_state(display_state_t state, const char *text)
 
     if (!s_label) {
         s_label = lv_label_create(scr);
-        lv_obj_center(s_label);
+        lv_obj_align(s_label, LV_ALIGN_CENTER, 0, -16);
         lv_label_set_long_mode(s_label, LV_LABEL_LONG_WRAP);
         lv_obj_set_width(s_label, LCD_H_RES - 60);
         lv_obj_set_style_text_align(s_label, LV_TEXT_ALIGN_CENTER, 0);
     }
     lv_obj_set_style_text_color(s_label, lv_color_make(0xFF, 0xFF, 0xFF), 0);
     if (text) lv_label_set_text(s_label, text);
+
+    display_lvgl_unlock();
+}
+
+void display_set_mqtt_connected(bool connected)
+{
+    if (!display_lvgl_lock(100)) return;
+
+    lv_obj_t *scr = lv_scr_act();
+    if (!s_mqtt_label) {
+        s_mqtt_label = lv_label_create(scr);
+        lv_obj_align(s_mqtt_label, LV_ALIGN_BOTTOM_MID, 0, -48);
+        lv_obj_set_style_text_align(s_mqtt_label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_text(s_mqtt_label, "");
+    }
+
+    if (connected) {
+        lv_obj_set_style_text_color(s_mqtt_label, lv_color_make(0x00, 0xFF, 0x88), 0);
+        lv_label_set_text(s_mqtt_label, LV_SYMBOL_WIFI " MQTT");
+    } else {
+        lv_obj_set_style_text_color(s_mqtt_label, lv_color_make(0x66, 0x66, 0x66), 0);
+        lv_label_set_text(s_mqtt_label, LV_SYMBOL_WIFI " MQTT");
+    }
 
     display_lvgl_unlock();
 }

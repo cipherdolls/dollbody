@@ -1,0 +1,187 @@
+#include "mqtt.h"
+#include "config.h"
+#include "events.h"
+#include "display.h"
+#include "esp_log.h"
+#include "mqtt_client.h"
+#include "esp_heap_caps.h"
+#include "esp_wifi.h"
+#include "cJSON.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include <string.h>
+#include <stdio.h>
+
+static const char *TAG = "mqtt";
+
+static esp_mqtt_client_handle_t s_client = NULL;
+static char s_client_id[80]; // "doll_{doll_id}"
+
+// ── Publish helpers ───────────────────────────────────────────────────────────
+
+static void publish_connection_event(const char *status)
+{
+    cJSON *body = cJSON_CreateObject();
+    cJSON_AddStringToObject(body, "clientId",   s_client_id);
+    cJSON_AddStringToObject(body, "deviceType", "doll");
+    cJSON_AddStringToObject(body, "deviceId",   g_config.doll_id);
+    cJSON_AddStringToObject(body, "status",     status);
+    char *payload = cJSON_PrintUnformatted(body);
+    cJSON_Delete(body);
+    esp_mqtt_client_publish(s_client, "connections", payload, 0, 0, 0);
+    free(payload);
+}
+
+// ── Incoming message handler ──────────────────────────────────────────────────
+
+static void handle_action_event(const char *data, int data_len)
+{
+    cJSON *json = cJSON_ParseWithLength(data, data_len);
+    if (!json) return;
+
+    const char *type   = cJSON_GetStringValue(cJSON_GetObjectItem(json, "type"));
+    const char *action = cJSON_GetStringValue(cJSON_GetObjectItem(json, "action"));
+
+    if (type && action) {
+        if (strcmp(type, "audio") == 0) {
+            // TODO: forward to audio module
+            ESP_LOGI(TAG, "audio action: %s", action);
+        } else if (strcmp(type, "system") == 0) {
+            ESP_LOGI(TAG, "system action: %s", action);
+            if (strcmp(action, "deepsleep") == 0) {
+                xEventGroupSetBits(g_events, EVT_DEEP_SLEEP);
+            } else if (strcmp(action, "restart") == 0) {
+                esp_restart();
+            }
+        }
+    }
+
+    cJSON_Delete(json);
+}
+
+// ── MQTT event handler ────────────────────────────────────────────────────────
+
+static void mqtt_event_handler(void *arg, esp_event_base_t base,
+                               int32_t event_id, void *event_data)
+{
+    esp_mqtt_event_handle_t evt = (esp_mqtt_event_handle_t)event_data;
+
+    switch ((esp_mqtt_event_id_t)event_id) {
+
+    case MQTT_EVENT_CONNECTED:
+        ESP_LOGI(TAG, "Connected to %s", g_config.mqtt_url);
+        xEventGroupClearBits(g_events, EVT_MQTT_DISCONNECTED);
+        xEventGroupSetBits(g_events, EVT_MQTT_CONNECTED);
+        display_set_mqtt_connected(true);
+
+        publish_connection_event("connected");
+
+        // Subscribe to action events for this doll
+        char action_topic[128];
+        snprintf(action_topic, sizeof(action_topic),
+                 "dolls/%s/actionEvents", g_config.doll_id);
+        esp_mqtt_client_subscribe(s_client, action_topic, 0);
+        ESP_LOGI(TAG, "Subscribed to %s", action_topic);
+        break;
+
+    case MQTT_EVENT_DISCONNECTED:
+        ESP_LOGW(TAG, "Disconnected");
+        xEventGroupClearBits(g_events, EVT_MQTT_CONNECTED);
+        xEventGroupSetBits(g_events, EVT_MQTT_DISCONNECTED);
+        display_set_mqtt_connected(false);
+        break;
+
+    case MQTT_EVENT_DATA: {
+        // Copy topic to null-terminated buffer for comparison
+        char topic[128] = {};
+        int tlen = evt->topic_len < (int)sizeof(topic) - 1
+                 ? evt->topic_len : (int)sizeof(topic) - 1;
+        memcpy(topic, evt->topic, tlen);
+
+        char expected[128];
+        snprintf(expected, sizeof(expected),
+                 "dolls/%s/actionEvents", g_config.doll_id);
+
+        if (strcmp(topic, expected) == 0) {
+            handle_action_event(evt->data, evt->data_len);
+        }
+        break;
+    }
+
+    case MQTT_EVENT_ERROR:
+        ESP_LOGE(TAG, "Error");
+        break;
+
+    default:
+        break;
+    }
+}
+
+// ── Metrics task — publishes every 30 s while connected ──────────────────────
+
+static void metrics_task(void *arg)
+{
+    char topic[128];
+    snprintf(topic, sizeof(topic), "dolls/%s/metrics", g_config.doll_id);
+
+    while (1) {
+        xEventGroupWaitBits(g_events, EVT_MQTT_CONNECTED,
+                            pdFALSE, pdFALSE, portMAX_DELAY);
+
+        wifi_ap_record_t ap = {};
+        esp_wifi_sta_get_ap_info(&ap);
+
+        EventBits_t bits = xEventGroupGetBits(g_events);
+
+        cJSON *body = cJSON_CreateObject();
+        cJSON_AddNumberToObject(body, "recording",          (bits & EVT_AUDIO_RECORDING) ? 1 : 0);
+        cJSON_AddBoolToObject  (body, "t1",                 false);
+        cJSON_AddBoolToObject  (body, "t2",                 false);
+        cJSON_AddNumberToObject(body, "freeSRAM",           (int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+        cJSON_AddNumberToObject(body, "freePSRAM",          (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+        cJSON_AddNumberToObject(body, "wifiRSSI",           ap.rssi);
+        cJSON_AddNumberToObject(body, "deepSleepCountdown", 0);
+        char *payload = cJSON_PrintUnformatted(body);
+        cJSON_Delete(body);
+
+        esp_mqtt_client_publish(s_client, topic, payload, 0, 0, 0);
+        ESP_LOGD(TAG, "metrics → %s", payload);
+        free(payload);
+
+        vTaskDelay(pdMS_TO_TICKS(30000));
+    }
+}
+
+// ── Connect task — waits for doll_id then starts the client ──────────────────
+
+static void mqtt_connect_task(void *arg)
+{
+    xEventGroupWaitBits(g_events, EVT_DOLL_READY,
+                        pdFALSE, pdFALSE, portMAX_DELAY);
+
+    snprintf(s_client_id, sizeof(s_client_id), "doll_%s", g_config.doll_id);
+
+    esp_mqtt_client_config_t cfg = {
+        .broker.address.uri                       = g_config.mqtt_url,
+        .credentials.client_id                    = s_client_id,
+        .credentials.username                     = s_client_id,
+        .credentials.authentication.password      = g_config.apikey,
+    };
+
+    s_client = esp_mqtt_client_init(&cfg);
+    esp_mqtt_client_register_event(s_client, ESP_EVENT_ANY_ID,
+                                   mqtt_event_handler, NULL);
+    esp_mqtt_client_start(s_client);
+    ESP_LOGI(TAG, "Connecting to %s as %s", g_config.mqtt_url, s_client_id);
+
+    xTaskCreate(metrics_task, "mqtt_metrics", 4096, NULL, 2, NULL);
+
+    vTaskDelete(NULL);
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+void mqtt_start(void)
+{
+    xTaskCreate(mqtt_connect_task, "mqtt_connect", 4096, NULL, 3, NULL);
+}

@@ -1,6 +1,7 @@
 #pragma once
 #include "esp_err.h"
 #include "lvgl.h"
+#include <stdbool.h>
 
 esp_err_t display_init(void);
 bool display_lvgl_lock(int timeout_ms);
@@ -19,3 +20,4 @@ typedef enum {
 } display_state_t;
 
 void display_set_state(display_state_t state, const char *text);
+void display_set_mqtt_connected(bool connected);

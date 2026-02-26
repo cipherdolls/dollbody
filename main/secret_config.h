@@ -24,3 +24,7 @@
 #ifndef SECRET_SERVER_URL
 #define SECRET_SERVER_URL "https://api.cipherdolls.com"
 #endif
+
+#ifndef SECRET_MQTT_URL
+#define SECRET_MQTT_URL "mqtt://api.cipherdolls.com:1883"
+#endif

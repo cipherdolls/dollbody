@@ -17,6 +17,7 @@ esp_err_t config_store_load(void)
     strlcpy(g_config.apikey,       SECRET_APIKEY,       sizeof(g_config.apikey));
     strlcpy(g_config.doll_body_id, SECRET_DOLL_BODY_ID, sizeof(g_config.doll_body_id));
     strlcpy(g_config.server_url,   SECRET_SERVER_URL,   sizeof(g_config.server_url));
+    strlcpy(g_config.mqtt_url,     SECRET_MQTT_URL,     sizeof(g_config.mqtt_url));
     g_config.provisioned = (strlen(g_config.ssid) > 0);
     g_config.doll_id[0]  = '\0';
 

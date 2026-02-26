@@ -9,9 +9,10 @@ idf_component_register(
          "wifi_prov.c"
          "power.c"
          "http.c"
+         "mqtt.c"
     INCLUDE_DIRS "."
     REQUIRES driver esp_psram esp_wifi nvs_flash esp_event esp_lcd
-             esp_netif esp_timer freertos
+             esp_netif esp_timer freertos mqtt
              espressif__led_strip esp_http_client json mbedtls
 )
 
@@ -19,7 +20,7 @@ idf_component_register(
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../.env)
 
 # Inject secrets from environment variables (source .env before building)
-foreach(VAR SECRET_SSID SECRET_PASSWORD SECRET_APIKEY SECRET_DOLL_BODY_ID SECRET_SERVER_URL)
+foreach(VAR SECRET_SSID SECRET_PASSWORD SECRET_APIKEY SECRET_DOLL_BODY_ID SECRET_SERVER_URL SECRET_MQTT_URL)
     if(DEFINED ENV{${VAR}})
         target_compile_definitions(${COMPONENT_LIB} PRIVATE ${VAR}="$ENV{${VAR}}")
     endif()

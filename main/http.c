@@ -2,6 +2,7 @@
 #include "config.h"
 #include "config_store.h"
 #include "display.h"
+#include "events.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 #include "esp_log.h"
@@ -109,6 +110,7 @@ static void sync_task(void *arg)
                 char msg[80];
                 snprintf(msg, sizeof(msg), "Doll ID:\n%.36s", g_config.doll_id);
                 display_set_state(DISPLAY_STATE_WIFI_OK, msg);
+                xEventGroupSetBits(g_events, EVT_DOLL_READY);
                 goto done;
             }
 
@@ -169,6 +171,7 @@ static void sync_task(void *arg)
                     char msg[80];
                     snprintf(msg, sizeof(msg), "Doll ID:\n%.36s", g_config.doll_id);
                     display_set_state(DISPLAY_STATE_WIFI_OK, msg);
+                    xEventGroupSetBits(g_events, EVT_DOLL_READY);
                 }
                 cJSON_Delete(json);
             }

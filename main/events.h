@@ -12,5 +12,6 @@
 #define EVT_AUDIO_PLAYING       (1 << 6)
 #define EVT_AUDIO_RECORDING     (1 << 7)
 #define EVT_DEEP_SLEEP          (1 << 8)
+#define EVT_DOLL_READY          (1 << 9)   // doll_id confirmed with backend
 
 extern EventGroupHandle_t g_events;
