@@ -16,6 +16,7 @@
 #include "power.h"
 #include "http.h"
 #include "mqtt.h"
+#include "audio.h"
 
 static const char *TAG = "main";
 
@@ -64,6 +65,7 @@ void app_main(void)
 
         if (bits & EVT_WIFI_GOT_IP) {
             display_set_state(DISPLAY_STATE_WIFI_OK, "Connected!");
+            audio_init();
             http_sync_doll();
             mqtt_start();
         } else {

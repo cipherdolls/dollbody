@@ -9,6 +9,7 @@
 #define CONFIG_DOLL_ID_MAX       64
 #define CONFIG_SERVER_MAX        128
 #define CONFIG_MQTT_URL_MAX      128
+#define CONFIG_CHAT_ID_MAX       64
 
 typedef struct {
     char ssid[CONFIG_SSID_MAX];
@@ -18,6 +19,7 @@ typedef struct {
     char doll_id[CONFIG_DOLL_ID_MAX];            // obtained from backend after POST /dolls
     char server_url[CONFIG_SERVER_MAX];
     char mqtt_url[CONFIG_MQTT_URL_MAX];
+    char chat_id[CONFIG_CHAT_ID_MAX];   // populated at runtime from GET /dolls/:id
     bool provisioned;
 } doll_config_t;
 

@@ -79,9 +79,11 @@ static void show_chat_status(const char *resp_json)
     cJSON *j = cJSON_Parse(resp_json);
     const char *cid = j ? cJSON_GetStringValue(cJSON_GetObjectItem(j, "chatId")) : NULL;
     if (cid && strlen(cid) > 0) {
+        strlcpy(g_config.chat_id, cid, sizeof(g_config.chat_id));
         snprintf(msg, sizeof(msg), "Doll ID:\n%.36s\nChat ID:\n%.36s",
                  g_config.doll_id, cid);
     } else {
+        memset(g_config.chat_id, 0, sizeof(g_config.chat_id));
         snprintf(msg, sizeof(msg), "Doll ID:\n%.36s\nNo chat linked",
                  g_config.doll_id);
     }

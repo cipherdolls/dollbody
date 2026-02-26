@@ -1,0 +1,292 @@
+#include "audio.h"
+#include "board.h"
+#include "config.h"
+#include "events.h"
+#include "display.h"
+#include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "esp_http_client.h"
+#include "esp_crt_bundle.h"
+#include "driver/i2s_std.h"
+#include "driver/i2c.h"
+#include "es8311.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include <string.h>
+#include <stdio.h>
+
+#define ES8311_ADDR     0x18   // ADDR pin low on SenseCAP Watcher
+#define ES8311_MCLK_HZ  (16 * 44100)  // 16× MCLK ratio
+
+#define MINIMP3_IMPLEMENTATION
+#define MINIMP3_ONLY_MP3
+#include "minimp3.h"
+
+static const char *TAG = "audio";
+
+static i2s_chan_handle_t  s_tx_chan = NULL;
+static QueueHandle_t      s_queue  = NULL;
+static volatile bool      s_stop   = false;
+
+// PSRAM-allocated decode buffers — keeps internal SRAM free for TLS/WiFi/LVGL heap
+static mp3dec_t  *s_dec    = NULL;
+static int16_t   *s_pcm    = NULL;  // MINIMP3_MAX_SAMPLES_PER_FRAME*2 shorts
+static int16_t   *s_stereo = NULL;  // mono→stereo expansion buffer (same size)
+
+// Static task descriptor must be in DRAM; stack goes in PSRAM
+static StaticTask_t s_audio_tcb;
+
+#define AUDIO_MSG_ID_MAX  80
+#define AUDIO_DL_MAX      (512 * 1024)   // 512 KB — enough for ~30 s of TTS at 128 kbps
+
+typedef struct {
+    char message_id[AUDIO_MSG_ID_MAX];
+} play_req_t;
+
+// ── I2S ──────────────────────────────────────────────────────────────────────
+
+static es8311_handle_t s_codec = NULL;
+
+static void codec_init(int sample_rate)
+{
+    // I2C is already initialized by display.c (lcd_power_on uses AUDIO_I2C_PORT)
+    s_codec = es8311_create(AUDIO_I2C_PORT, ES8311_ADDR);
+    if (!s_codec) {
+        ESP_LOGE(TAG, "ES8311 create failed");
+        return;
+    }
+
+    es8311_clock_config_t clk = {
+        .mclk_inverted      = false,
+        .sclk_inverted      = false,
+        .mclk_from_mclk_pin = true,
+        .sample_frequency   = sample_rate,
+    };
+    ESP_ERROR_CHECK(es8311_init(s_codec, &clk, ES8311_RESOLUTION_16, ES8311_RESOLUTION_16));
+    ESP_ERROR_CHECK(es8311_sample_frequency_config(s_codec, ES8311_MCLK_HZ, sample_rate));
+    ESP_ERROR_CHECK(es8311_voice_volume_set(s_codec, 70, NULL));
+    ESP_ERROR_CHECK(es8311_microphone_config(s_codec, false));
+    ESP_LOGI(TAG, "ES8311 initialized at %d Hz, volume 70", sample_rate);
+}
+
+static void i2s_start(int sample_rate)
+{
+    if (s_tx_chan) {
+        i2s_channel_disable(s_tx_chan);
+        i2s_del_channel(s_tx_chan);
+        s_tx_chan = NULL;
+    }
+
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_PORT, I2S_ROLE_MASTER);
+    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &s_tx_chan, NULL));
+
+    i2s_std_config_t std_cfg = {
+        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk         = I2S_MCLK,
+            .bclk         = I2S_BCLK,
+            .ws           = I2S_WS,
+            .dout         = I2S_DOUT,
+            .din          = I2S_GPIO_UNUSED,
+            .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
+        },
+    };
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_tx_chan, &std_cfg));
+    ESP_ERROR_CHECK(i2s_channel_enable(s_tx_chan));
+
+    // Init codec on first call (sample_rate known from MP3 frame header)
+    if (!s_codec) {
+        codec_init(sample_rate);
+    }
+
+    ESP_LOGI(TAG, "I2S started: %d Hz stereo (Philips)", sample_rate);
+}
+
+static void i2s_stop_ch(void)
+{
+    if (s_tx_chan) {
+        i2s_channel_disable(s_tx_chan);
+        i2s_del_channel(s_tx_chan);
+        s_tx_chan = NULL;
+    }
+}
+
+// ── HTTP download ─────────────────────────────────────────────────────────────
+
+typedef struct { uint8_t *buf; size_t cap; size_t len; } dl_ctx_t;
+
+static esp_err_t dl_event(esp_http_client_event_t *evt)
+{
+    dl_ctx_t *d = (dl_ctx_t *)evt->user_data;
+    if (evt->event_id == HTTP_EVENT_ON_DATA && d) {
+        size_t space = d->cap - d->len;
+        size_t copy  = (size_t)evt->data_len < space ? (size_t)evt->data_len : space;
+        memcpy(d->buf + d->len, evt->data, copy);
+        d->len += copy;
+    }
+    return ESP_OK;
+}
+
+static size_t download_mp3(const char *message_id, uint8_t **out)
+{
+    // Prefer PSRAM; fall back to internal heap for small boards
+    uint8_t *buf = heap_caps_malloc(AUDIO_DL_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) buf = malloc(64 * 1024);
+    if (!buf) { ESP_LOGE(TAG, "No memory for download"); return 0; }
+
+    dl_ctx_t ctx = { .buf = buf, .cap = AUDIO_DL_MAX, .len = 0 };
+
+    char url[256], auth[128];
+    snprintf(url,  sizeof(url),  "%s/messages/%s/audio", g_config.server_url, message_id);
+    snprintf(auth, sizeof(auth), "Bearer %s", g_config.apikey);
+
+    esp_http_client_config_t cfg = {
+        .url               = url,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .event_handler     = dl_event,
+        .user_data         = &ctx,
+        .buffer_size       = 4096,
+        .timeout_ms        = 20000,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    esp_http_client_set_header(client, "Authorization", auth);
+
+    int status = -1;
+    if (esp_http_client_perform(client) == ESP_OK)
+        status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+
+    if (status != 200 || ctx.len == 0) {
+        ESP_LOGE(TAG, "Download failed status=%d len=%zu", status, ctx.len);
+        free(buf);
+        return 0;
+    }
+
+    ESP_LOGI(TAG, "Downloaded %zu B for msg %s", ctx.len, message_id);
+    *out = buf;
+    return ctx.len;
+}
+
+// ── MP3 decode + I2S playback ─────────────────────────────────────────────────
+
+static void play_mp3(const uint8_t *data, size_t len)
+{
+    mp3dec_frame_info_t info = {};
+    mp3dec_init(s_dec);
+
+    const uint8_t *ptr     = data;
+    size_t         rem     = len;
+    bool           started = false;
+
+    s_stop = false;
+    xEventGroupSetBits(g_events, EVT_AUDIO_PLAYING);
+    display_set_state(DISPLAY_STATE_PLAYING, "Playing...");
+
+    while (rem > 0 && !s_stop) {
+        int samples = mp3dec_decode_frame(s_dec, ptr, (int)rem, s_pcm, &info);
+
+        if (info.frame_bytes == 0) break;   // corrupt or end of stream
+        ptr += info.frame_bytes;
+        rem -= info.frame_bytes;
+
+        if (samples <= 0) continue;         // ID3 / padding frame
+
+        // Init I2S once we know the sample rate from the first decoded frame
+        if (!started) {
+            i2s_start(info.hz);
+            started = true;
+        }
+
+        int16_t *out   = s_pcm;
+        size_t   bytes = (size_t)samples * info.channels * sizeof(int16_t);
+
+        if (info.channels == 1) {
+            // Expand mono → interleaved stereo so I2S slot is happy
+            for (int i = 0; i < samples; i++) {
+                s_stereo[i * 2]     = s_pcm[i];
+                s_stereo[i * 2 + 1] = s_pcm[i];
+            }
+            out   = s_stereo;
+            bytes = (size_t)samples * 2 * sizeof(int16_t);
+        }
+
+        size_t written = 0;
+        i2s_channel_write(s_tx_chan, out, bytes, &written, pdMS_TO_TICKS(2000));
+    }
+
+    if (started) {
+        vTaskDelay(pdMS_TO_TICKS(150));  // let DMA drain
+        i2s_stop_ch();
+    }
+
+    xEventGroupClearBits(g_events, EVT_AUDIO_PLAYING);
+
+    // Restore display to doll/chat ID view
+    char msg[128];
+    if (strlen(g_config.chat_id) > 0) {
+        snprintf(msg, sizeof(msg), "Doll ID:\n%.36s\nChat ID:\n%.36s",
+                 g_config.doll_id, g_config.chat_id);
+    } else {
+        snprintf(msg, sizeof(msg), "Doll ID:\n%.36s\nNo chat linked",
+                 g_config.doll_id);
+    }
+    display_set_state(DISPLAY_STATE_WIFI_OK, msg);
+}
+
+// ── Play task ─────────────────────────────────────────────────────────────────
+
+static void audio_play_task(void *arg)
+{
+    play_req_t req;
+    while (1) {
+        if (xQueueReceive(s_queue, &req, portMAX_DELAY) != pdTRUE) continue;
+
+        uint8_t *buf = NULL;
+        size_t   len = download_mp3(req.message_id, &buf);
+        if (len > 0 && buf) {
+            play_mp3(buf, len);
+        }
+        free(buf);
+    }
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+void audio_init(void)
+{
+    // Allocate decode buffers from PSRAM so internal SRAM stays free for TLS/WiFi heap
+    s_dec    = heap_caps_malloc(sizeof(mp3dec_t),
+                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_pcm    = heap_caps_malloc(MINIMP3_MAX_SAMPLES_PER_FRAME * 2 * sizeof(int16_t),
+                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_stereo = heap_caps_malloc(MINIMP3_MAX_SAMPLES_PER_FRAME * 2 * sizeof(int16_t),
+                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    assert(s_dec && s_pcm && s_stereo);
+
+    // Allocate task stack from PSRAM — minimp3 decode uses ~10 KB of stack
+    // (float grbuf[2][576] + call chain), keeping DRAM free for LVGL/TLS
+    StackType_t *audio_stack = heap_caps_malloc(
+        32768, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    assert(audio_stack);
+
+    s_queue = xQueueCreate(4, sizeof(play_req_t));
+    xTaskCreateStaticPinnedToCore(audio_play_task, "audio_play",
+        32768 / sizeof(StackType_t), NULL, 5, audio_stack, &s_audio_tcb, 0);
+    ESP_LOGI(TAG, "Audio subsystem ready (PSRAM stack + decode buffers)");
+}
+
+void audio_play_message(const char *message_id)
+{
+    play_req_t req = {};
+    strlcpy(req.message_id, message_id, sizeof(req.message_id));
+    if (xQueueSend(s_queue, &req, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "Play queue full, dropping %s", message_id);
+    }
+}
+
+void audio_stop(void)
+{
+    s_stop = true;
+}

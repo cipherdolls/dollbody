@@ -10,10 +10,12 @@ idf_component_register(
          "power.c"
          "http.c"
          "mqtt.c"
+         "audio.c"
     INCLUDE_DIRS "."
     REQUIRES driver esp_psram esp_wifi nvs_flash esp_event esp_lcd
              esp_netif esp_timer freertos mqtt lwip
              espressif__led_strip esp_http_client json mbedtls
+             espressif__es8311
 )
 
 # Re-run CMake whenever .env changes so new values are always picked up

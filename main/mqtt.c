@@ -1,4 +1,5 @@
 #include "mqtt.h"
+#include "audio.h"
 #include "config.h"
 #include "events.h"
 #include "display.h"
@@ -45,8 +46,18 @@ static void handle_action_event(const char *data, int data_len)
 
     if (type && action) {
         if (strcmp(type, "audio") == 0) {
-            // TODO: forward to audio module
-            ESP_LOGI(TAG, "audio action: %s", action);
+            if (strcmp(action, "play") == 0 || strcmp(action, "replay") == 0) {
+                const char *mid = cJSON_GetStringValue(cJSON_GetObjectItem(json, "messageId"));
+                if (mid) {
+                    ESP_LOGI(TAG, "Audio message arrived: %.36s", mid);
+                    display_set_state(DISPLAY_STATE_PROCESSING, "New message!\nDownloading...");
+                    audio_play_message(mid);
+                } else {
+                    ESP_LOGW(TAG, "audio play missing messageId");
+                }
+            } else if (strcmp(action, "stop") == 0) {
+                audio_stop();
+            }
         } else if (strcmp(type, "system") == 0) {
             ESP_LOGI(TAG, "system action: %s", action);
             if (strcmp(action, "deepsleep") == 0) {
@@ -77,12 +88,21 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
 
         publish_connection_event("connected");
 
-        // Subscribe to action events for this doll
+        // Subscribe to doll-level action events
         char action_topic[128];
         snprintf(action_topic, sizeof(action_topic),
                  "dolls/%s/actionEvents", g_config.doll_id);
         esp_mqtt_client_subscribe(s_client, action_topic, 0);
         ESP_LOGI(TAG, "Subscribed to %s", action_topic);
+
+        // Subscribe to chat-level action events (audio play arrives here)
+        if (strlen(g_config.chat_id) > 0) {
+            char chat_topic[128];
+            snprintf(chat_topic, sizeof(chat_topic),
+                     "chats/%s/actionEvents", g_config.chat_id);
+            esp_mqtt_client_subscribe(s_client, chat_topic, 0);
+            ESP_LOGI(TAG, "Subscribed to %s", chat_topic);
+        }
         break;
 
     case MQTT_EVENT_DISCONNECTED:
@@ -99,11 +119,14 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
                  ? evt->topic_len : (int)sizeof(topic) - 1;
         memcpy(topic, evt->topic, tlen);
 
-        char expected[128];
-        snprintf(expected, sizeof(expected),
+        char doll_topic[128], chat_topic[128];
+        snprintf(doll_topic, sizeof(doll_topic),
                  "dolls/%s/actionEvents", g_config.doll_id);
+        snprintf(chat_topic, sizeof(chat_topic),
+                 "chats/%s/actionEvents", g_config.chat_id);
 
-        if (strcmp(topic, expected) == 0) {
+        if (strcmp(topic, doll_topic) == 0 ||
+            (strlen(g_config.chat_id) > 0 && strcmp(topic, chat_topic) == 0)) {
             display_mqtt_rx_pulse();
             handle_action_event(evt->data, evt->data_len);
         }
