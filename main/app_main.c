@@ -14,6 +14,7 @@
 #include "wifi_mgr.h"
 #include "wifi_prov.h"
 #include "power.h"
+#include "http.h"
 
 static const char *TAG = "main";
 
@@ -62,6 +63,7 @@ void app_main(void)
 
         if (bits & EVT_WIFI_GOT_IP) {
             display_set_state(DISPLAY_STATE_WIFI_OK, "Connected!");
+            http_sync_doll();
         } else {
             display_set_state(DISPLAY_STATE_ERROR, "WiFi failed\nHold button to re-setup");
         }

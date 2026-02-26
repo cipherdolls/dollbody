@@ -5,7 +5,8 @@ doll_config_t g_config = {
     .ssid        = "",
     .password    = "",
     .apikey      = "",
-    .doll_id     = "",
-    .server_url  = "https://api.cipherdolls.com",
+    .doll_body_id = "",
+    .doll_id      = "",
+    .server_url   = "https://api.cipherdolls.com",
     .provisioned = false,
 };

@@ -1,0 +1,25 @@
+#pragma once
+
+// Secrets are injected at build time from environment variables.
+// Copy .env.example to .env, fill in your values, then:
+//   source .env && idf.py build
+
+#ifndef SECRET_SSID
+#define SECRET_SSID       "your_wifi_ssid"
+#endif
+
+#ifndef SECRET_PASSWORD
+#define SECRET_PASSWORD   "your_wifi_password"
+#endif
+
+#ifndef SECRET_APIKEY
+#define SECRET_APIKEY     "your_api_key"
+#endif
+
+#ifndef SECRET_DOLL_BODY_ID
+#define SECRET_DOLL_BODY_ID    "your_doll_body_id"
+#endif
+
+#ifndef SECRET_SERVER_URL
+#define SECRET_SERVER_URL "https://api.cipherdolls.com"
+#endif
