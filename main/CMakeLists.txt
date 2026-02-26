@@ -12,7 +12,7 @@ idf_component_register(
          "mqtt.c"
     INCLUDE_DIRS "."
     REQUIRES driver esp_psram esp_wifi nvs_flash esp_event esp_lcd
-             esp_netif esp_timer freertos mqtt
+             esp_netif esp_timer freertos mqtt lwip
              espressif__led_strip esp_http_client json mbedtls
 )
 

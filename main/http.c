@@ -7,6 +7,7 @@
 #include "esp_crt_bundle.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_sntp.h"
 #include "cJSON.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -72,8 +73,39 @@ static void get_mac_str(char *out, size_t out_sz)
 
 // ── Main sync task ────────────────────────────────────────────────────────────
 
+static void show_chat_status(const char *resp_json)
+{
+    char msg[128];
+    cJSON *j = cJSON_Parse(resp_json);
+    const char *cid = j ? cJSON_GetStringValue(cJSON_GetObjectItem(j, "chatId")) : NULL;
+    if (cid && strlen(cid) > 0) {
+        snprintf(msg, sizeof(msg), "Doll ID:\n%.36s\nChat ID:\n%.36s",
+                 g_config.doll_id, cid);
+    } else {
+        snprintf(msg, sizeof(msg), "Doll ID:\n%.36s\nNo chat linked",
+                 g_config.doll_id);
+    }
+    if (j) cJSON_Delete(j);
+    display_set_state(DISPLAY_STATE_WIFI_OK, msg);
+}
+
 static void sync_task(void *arg)
 {
+    // Sync system clock via NTP — required for TLS certificate date validation
+    display_set_state(DISPLAY_STATE_PROCESSING, "Syncing time...");
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_init();
+    int sntp_retries = 0;
+    while (sntp_get_sync_status() != SNTP_SYNC_STATUS_COMPLETED && sntp_retries++ < 10) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    if (sntp_retries >= 10) {
+        ESP_LOGW(TAG, "SNTP sync timed out");
+    } else {
+        ESP_LOGI(TAG, "SNTP synced OK");
+    }
+
     char url[256];
     char auth[128];
     char mac[18];
@@ -107,9 +139,7 @@ static void sync_task(void *arg)
             }
             if (status == 200) {
                 ESP_LOGI(TAG, "Doll verified: %s", g_config.doll_id);
-                char msg[80];
-                snprintf(msg, sizeof(msg), "Doll ID:\n%.36s", g_config.doll_id);
-                display_set_state(DISPLAY_STATE_WIFI_OK, msg);
+                show_chat_status(resp.buf);
                 xEventGroupSetBits(g_events, EVT_DOLL_READY);
                 goto done;
             }
@@ -168,9 +198,7 @@ static void sync_task(void *arg)
                     strlcpy(g_config.doll_id, id, sizeof(g_config.doll_id));
                     config_store_save();
                     ESP_LOGI(TAG, "Registered — doll_id=%s", g_config.doll_id);
-                    char msg[80];
-                    snprintf(msg, sizeof(msg), "Doll ID:\n%.36s", g_config.doll_id);
-                    display_set_state(DISPLAY_STATE_WIFI_OK, msg);
+                    show_chat_status(resp.buf);
                     xEventGroupSetBits(g_events, EVT_DOLL_READY);
                 }
                 cJSON_Delete(json);
