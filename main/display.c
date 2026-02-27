@@ -30,6 +30,9 @@ static lv_disp_draw_buf_t s_disp_buf;
 // Current status label (on the main screen)
 static lv_obj_t *s_label = NULL;
 
+// Battery indicator (top of screen)
+static lv_obj_t *s_batt_label = NULL;
+
 // MQTT connection indicator (bottom of screen)
 static lv_obj_t *s_mqtt_label = NULL;
 
@@ -359,4 +362,30 @@ void display_mqtt_rx_pulse(void)
     display_lvgl_unlock();
     esp_timer_stop(s_dim_timer_rx);
     esp_timer_start_once(s_dim_timer_rx, 300 * 1000);  // 300 ms
+}
+
+void display_set_battery(int percent, bool charging)
+{
+    if (!display_lvgl_lock(100)) return;
+
+    lv_obj_t *scr = lv_scr_act();
+    if (!s_batt_label) {
+        s_batt_label = lv_label_create(scr);
+        lv_obj_align(s_batt_label, LV_ALIGN_TOP_MID, 0, 8);
+        lv_obj_set_style_text_color(s_batt_label, lv_color_make(0xCC, 0xCC, 0xCC), 0);
+    }
+
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%s %d%%", charging ? LV_SYMBOL_CHARGE : LV_SYMBOL_BATTERY_FULL, percent);
+    lv_label_set_text(s_batt_label, buf);
+
+    // Colour: green > 50%, yellow 20-50%, red < 20%
+    lv_color_t col;
+    if (charging)        col = lv_color_make(0x00, 0xCC, 0xFF);  // cyan
+    else if (percent > 50) col = lv_color_make(0x00, 0xDD, 0x44);  // green
+    else if (percent > 20) col = lv_color_make(0xFF, 0xCC, 0x00);  // yellow
+    else                   col = lv_color_make(0xFF, 0x33, 0x33);  // red
+    lv_obj_set_style_text_color(s_batt_label, col, 0);
+
+    display_lvgl_unlock();
 }

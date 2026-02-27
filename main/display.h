@@ -23,3 +23,4 @@ void display_set_state(display_state_t state, const char *text);
 void display_set_mqtt_connected(bool connected);
 void display_mqtt_tx_pulse(void);   // flash TX dot (outgoing)
 void display_mqtt_rx_pulse(void);   // flash RX dot (incoming)
+void display_set_battery(int percent, bool charging);

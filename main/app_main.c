@@ -18,6 +18,7 @@
 #include "mqtt.h"
 #include "audio.h"
 #include "record.h"
+#include "battery.h"
 
 static const char *TAG = "main";
 
@@ -38,6 +39,9 @@ void app_main(void)
     // Display (includes IO expander power-on + LVGL)
     ESP_ERROR_CHECK(display_init());
     display_set_state(DISPLAY_STATE_BOOT, "Starting...");
+
+    // Battery monitor (ADC + display label, 30s interval)
+    battery_init();
 
     // LED (solid white, deep sleep turns it off)
     xTaskCreatePinnedToCore(led_task_fn, "led", 4096, NULL, 3, NULL, 1);

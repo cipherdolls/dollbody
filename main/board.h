@@ -32,10 +32,21 @@
 #define IO_EXP_KNOB_ADDR    0x77
 
 // PCA9535 registers
+#define PCA9535_INPUT0      0x00
 #define PCA9535_OUTPUT0     0x02
 #define PCA9535_OUTPUT1     0x03
 #define PCA9535_CONFIG0     0x06
 #define PCA9535_CONFIG1     0x07
+
+// --- Battery ADC (voltage divider via IO expander pin 15) ---
+#define BAT_ADC_GPIO        GPIO_NUM_3
+#define BAT_ADC_CHAN        ADC_CHANNEL_2   // GPIO3 = ADC1_CH2
+#define BAT_ADC_ATTEN       ADC_ATTEN_DB_2_5
+
+// IO expander port 0 power-status pins (active low)
+#define PWR_CHRG_DET_BIT    0   // pin 0: charging
+#define PWR_STDBY_DET_BIT   1   // pin 1: standby (fully charged)
+#define PWR_VBUS_DET_BIT    2   // pin 2: USB power present
 
 // --- RGB LED (WS2812) ---
 #define LED_GPIO            GPIO_NUM_40
