@@ -69,9 +69,9 @@ Devices on this bus:
 
 | Device | Address | Function |
 |--------|---------|----------|
-| ES8311 | 0x30 | DAC (speaker output) |
-| ES7243 | 0x13 | ADC (microphone input) |
-| PCA9535 | 0x77 | 16-bit I/O expander |
+| ES8311 | 0x18 | DAC (speaker output) |
+| ES7243E | 0x14 | ADC (microphone input, chip ID 0x7A43) |
+| PCA9535 | 0x21 | 16-bit I/O expander (power/camera) |
 
 ### RGB LED (WS2812)
 
@@ -93,7 +93,7 @@ Devices on this bus:
 
 | Bus | Port | SDA | SCL | Speed | Devices |
 |-----|------|-----|-----|-------|---------|
-| Audio/General | I2C_NUM_0 | GPIO 47 | GPIO 48 | 100 kHz | ES8311 (0x30), ES7243 (0x13), PCA9535 (0x77) |
+| Audio/General | I2C_NUM_0 | GPIO 47 | GPIO 48 | 100 kHz | ES8311 (0x18), ES7243E (0x14), PCA9535 (0x21) |
 | Touch | I2C_NUM_1 | GPIO 39 | GPIO 38 | 400 kHz | SPD2010 touch (0x53) |
 
 ## CPU Core Assignment

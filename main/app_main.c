@@ -17,6 +17,7 @@
 #include "http.h"
 #include "mqtt.h"
 #include "audio.h"
+#include "record.h"
 
 static const char *TAG = "main";
 
@@ -68,6 +69,7 @@ void app_main(void)
             audio_init();
             http_sync_doll();
             mqtt_start();
+            record_init();
         } else {
             display_set_state(DISPLAY_STATE_ERROR, "WiFi failed\nHold button to re-setup");
         }

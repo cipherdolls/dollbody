@@ -11,6 +11,12 @@
 static const char *TAG = "touch";
 static esp_lcd_touch_handle_t s_tp = NULL;
 
+// Cached touch state written by the LVGL callback (runs in LVGL task).
+// touch_get_point() reads this cache — no direct I2C call from other tasks.
+static volatile bool     s_touched = false;
+static volatile uint16_t s_touch_x = 0;
+static volatile uint16_t s_touch_y = 0;
+
 // I2C bus recovery: 9 SCL pulses + STOP + reinstall
 static void touch_i2c_bus_recover(void)
 {
@@ -46,10 +52,14 @@ static void lvgl_touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
     esp_lcd_touch_read_data(s_tp);
     bool pressed = esp_lcd_touch_get_coordinates(s_tp, &x, &y, NULL, &cnt, 1);
     if (pressed && cnt > 0) {
+        s_touched     = true;
+        s_touch_x     = x;
+        s_touch_y     = y;
         data->point.x = x;
         data->point.y = y;
         data->state   = LV_INDEV_STATE_PRESSED;
     } else {
+        s_touched   = false;
         data->state = LV_INDEV_STATE_RELEASED;
     }
 }
@@ -106,8 +116,8 @@ esp_err_t touch_init(void)
 
 bool touch_get_point(uint16_t *x, uint16_t *y)
 {
-    if (!s_tp) return false;
-    uint8_t cnt = 0;
-    esp_lcd_touch_read_data(s_tp);
-    return esp_lcd_touch_get_coordinates(s_tp, x, y, NULL, &cnt, 1) && cnt > 0;
+    if (!s_tp || !s_touched) return false;
+    if (x) *x = s_touch_x;
+    if (y) *y = s_touch_y;
+    return true;
 }

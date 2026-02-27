@@ -49,9 +49,13 @@ static void handle_action_event(const char *data, int data_len)
             if (strcmp(action, "play") == 0 || strcmp(action, "replay") == 0) {
                 const char *mid = cJSON_GetStringValue(cJSON_GetObjectItem(json, "messageId"));
                 if (mid) {
-                    ESP_LOGI(TAG, "Audio message arrived: %.36s", mid);
-                    display_set_state(DISPLAY_STATE_PROCESSING, "New message!\nDownloading...");
-                    audio_play_message(mid);
+                    if (xEventGroupGetBits(g_events) & EVT_AUDIO_RECORDING) {
+                        ESP_LOGW(TAG, "Recording in progress, skipping play %.36s", mid);
+                    } else {
+                        ESP_LOGI(TAG, "Audio message arrived: %.36s", mid);
+                        display_set_state(DISPLAY_STATE_PROCESSING, "New message!\nDownloading...");
+                        audio_play_message(mid);
+                    }
                 } else {
                     ESP_LOGW(TAG, "audio play missing messageId");
                 }

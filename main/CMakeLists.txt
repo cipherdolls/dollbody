@@ -11,6 +11,7 @@ idf_component_register(
          "http.c"
          "mqtt.c"
          "audio.c"
+         "record.c"
     INCLUDE_DIRS "."
     REQUIRES driver esp_psram esp_wifi nvs_flash esp_event esp_lcd
              esp_netif esp_timer freertos mqtt lwip
