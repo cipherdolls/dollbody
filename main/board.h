@@ -26,10 +26,10 @@
 #define AUDIO_I2C_SCL       GPIO_NUM_48
 #define AUDIO_I2C_FREQ      100000
 
-// --- IO Expander (PCA9535) on AUDIO_I2C bus ---
-// 0x21 = system power + camera; 0x77 = knob
-#define IO_EXP_PWR_ADDR     0x21
-#define IO_EXP_KNOB_ADDR    0x77
+// --- IO Expander (PCA9535 at 0x21) on AUDIO_I2C bus ---
+// Port 0: inputs (power status bits 0-2, knob button bit 3)
+// Port 1: outputs (power control, camera, etc.)
+#define IO_EXP_ADDR         0x21
 
 // PCA9535 registers
 #define PCA9535_INPUT0      0x00
@@ -67,7 +67,7 @@
 #define CAM_SPI_MISO        GPIO_NUM_6
 #define CAM_SPI_CS          GPIO_NUM_21
 #define CAM_SPI_CLK_HZ      (12 * 1000 * 1000)
-#define CAM_SYNC_PIN        6   // IO expander pin on IO_EXP_PWR_ADDR
+#define CAM_SYNC_PIN        6   // IO expander pin on IO_EXP_ADDR
 #define CAM_RESET_PIN       7
 #define CAM_POWER_PIN       11
 
@@ -77,4 +77,5 @@
 // --- Rotary Knob ---
 #define KNOB_A              GPIO_NUM_41
 #define KNOB_B              GPIO_NUM_42
-// Knob button is on IO_EXP_KNOB_ADDR pin 3
+// Knob button is on IO_EXP_ADDR port 0, pin 3 (active low)
+#define KNOB_BTN_BIT        3

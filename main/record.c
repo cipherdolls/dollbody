@@ -10,6 +10,7 @@
 #include "esp_heap_caps.h"
 #include "driver/i2s_std.h"
 #include "driver/i2c.h"
+#include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <string.h>
@@ -20,8 +21,6 @@ static const char *TAG = "record";
 #define SAMPLE_RATE      16000
 #define RECORD_MAX_S     20
 #define RECORD_BUF_BYTES (RECORD_MAX_S * SAMPLE_RATE * 2)   // 640 KB (mono, 16-bit)
-
-#define MULTIPART_BOUNDARY "----CipherDollsBoundary8f3kXp"
 
 #define ES7243_ADDR  0x14   // Confirmed by I2C scan on SenseCAP Watcher
 
@@ -125,6 +124,49 @@ static void es7243e_init(void)
     ESP_LOGI(TAG, "ES7243E init done (addr=0x%02X, chip ID 0x7A43)", ES7243_ADDR);
 }
 
+// ── Knob button — press to record, release to send ──────────────────────────
+// Button is on PCA9535 IO expander at 0x21 (IO_EXP_ADDR), port 0, pin 3.
+// Active low — pressed = bit clear.
+
+static bool s_knob_btn_ok = false;   // set true once first read succeeds
+
+static bool knob_btn_pressed(void)
+{
+    uint8_t reg = PCA9535_INPUT0;
+    uint8_t val = 0xFF;
+    esp_err_t err = i2c_master_write_read_device(
+        AUDIO_I2C_PORT, IO_EXP_ADDR,
+        &reg, 1, &val, 1, pdMS_TO_TICKS(50));
+    if (err != ESP_OK) {
+        if (s_knob_btn_ok) {
+            ESP_LOGW(TAG, "Knob I2C read failed: %s", esp_err_to_name(err));
+        }
+        return false;
+    }
+    if (!s_knob_btn_ok) {
+        s_knob_btn_ok = true;
+        ESP_LOGI(TAG, "Knob IO expander 0x%02X responding, port0=0x%02X",
+                 IO_EXP_ADDR, val);
+    }
+    return !(val & (1 << KNOB_BTN_BIT));   // active low
+}
+
+static void knob_init(void)
+{
+    // Configure port 0 pin 3 as input on the knob IO expander
+    uint8_t cmd[] = { PCA9535_CONFIG0, (1 << KNOB_BTN_BIT) };
+    esp_err_t err = i2c_master_write_to_device(
+        AUDIO_I2C_PORT, IO_EXP_ADDR,
+        cmd, sizeof(cmd), pdMS_TO_TICKS(100));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Knob IO expander 0x%02X not found (%s) — button disabled",
+                 IO_EXP_ADDR, esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "Knob button configured (IO exp 0x%02X, port0 pin %d)",
+                 IO_EXP_ADDR, KNOB_BTN_BIT);
+    }
+}
+
 // ── I2S RX ────────────────────────────────────────────────────────────────────
 
 static void i2s_rx_start(void)
@@ -160,45 +202,36 @@ static void i2s_rx_stop(void)
     }
 }
 
-// ── HTTP multipart upload ─────────────────────────────────────────────────────
+// ── Upload WAV to stream-recorder ────────────────────────────────────────────
+// POST /stream?chatId=... with raw WAV body (no multipart).
+// Stream-recorder converts WAV→MP3 and forwards to the backend.
 
-static void upload_audio(const uint8_t *pcm, size_t pcm_bytes)
+static void upload_to_stream_recorder(const uint8_t *pcm, size_t pcm_bytes)
 {
     wav_hdr_t hdr;
     build_wav_header(&hdr, pcm_bytes);
 
-    // Part 1: chatId form field + file field header
-    char preamble[512];
-    int preamble_len = snprintf(preamble, sizeof(preamble),
-        "--" MULTIPART_BOUNDARY "\r\n"
-        "Content-Disposition: form-data; name=\"chatId\"\r\n"
-        "\r\n"
-        "%s\r\n"
-        "--" MULTIPART_BOUNDARY "\r\n"
-        "Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n"
-        "Content-Type: audio/wav\r\n"
-        "\r\n",
-        g_config.chat_id);
-
-    const char *tail     = "\r\n--" MULTIPART_BOUNDARY "--\r\n";
-    int         tail_len = strlen(tail);
-
-    int total_len = preamble_len + (int)sizeof(wav_hdr_t) + (int)pcm_bytes + tail_len;
+    int total_len = (int)sizeof(wav_hdr_t) + (int)pcm_bytes;
 
     char url[256], auth[128];
-    snprintf(url,  sizeof(url),  "%s/messages", g_config.server_url);
-    snprintf(auth, sizeof(auth), "Bearer %s",   g_config.apikey);
+    snprintf(url,  sizeof(url),  "%s/stream?chatId=%s",
+             g_config.stream_recorder_url, g_config.chat_id);
+    snprintf(auth, sizeof(auth), "Bearer %s", g_config.apikey);
 
     esp_http_client_config_t cfg = {
         .url               = url,
         .method            = HTTP_METHOD_POST,
-        .crt_bundle_attach = esp_crt_bundle_attach,
         .timeout_ms        = 30000,
     };
+    if (strncmp(g_config.stream_recorder_url, "https", 5) == 0) {
+        cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    }
+
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     esp_http_client_set_header(client, "Authorization", auth);
-    esp_http_client_set_header(client, "Content-Type",
-        "multipart/form-data; boundary=----CipherDollsBoundary8f3kXp");
+    esp_http_client_set_header(client, "Content-Type", "audio/wav");
+
+    ESP_LOGI(TAG, "POST %s (%d bytes)", url, total_len);
 
     if (esp_http_client_open(client, total_len) != ESP_OK) {
         ESP_LOGE(TAG, "HTTP open failed");
@@ -206,10 +239,10 @@ static void upload_audio(const uint8_t *pcm, size_t pcm_bytes)
         return;
     }
 
-    esp_http_client_write(client, preamble, preamble_len);
+    // WAV header
     esp_http_client_write(client, (const char *)&hdr, sizeof(wav_hdr_t));
 
-    // Stream PCM in 4 KB chunks to keep stack usage low
+    // PCM data in 4 KB chunks
     size_t off = 0;
     while (off < pcm_bytes) {
         size_t n = pcm_bytes - off;
@@ -217,8 +250,6 @@ static void upload_audio(const uint8_t *pcm, size_t pcm_bytes)
         esp_http_client_write(client, (const char *)(pcm + off), n);
         off += n;
     }
-
-    esp_http_client_write(client, tail, tail_len);
 
     esp_http_client_fetch_headers(client);
     int status = esp_http_client_get_status_code(client);
@@ -248,12 +279,15 @@ static void restore_idle_display(void)
     display_set_state(DISPLAY_STATE_WIFI_OK, msg);
 }
 
-// ── Record task ───────────────────────────────────────────────────────────────
+// ── Record task — hold knob button to record, release to send ────────────────
 
 static void record_task(void *arg)
 {
     // touch_init() blocks ~3 s for the SPD2010 BIOS→CPU firmware transition
     touch_init();
+
+    // Configure knob button on IO expander
+    knob_init();
 
     uint8_t *pcm_buf = heap_caps_malloc(RECORD_BUF_BYTES,
                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -263,32 +297,32 @@ static void record_task(void *arg)
         vTaskDelete(NULL);
         return;
     }
-    ESP_LOGI(TAG, "Ready — %d s max, %d KB PSRAM buffer",
-             RECORD_MAX_S, RECORD_BUF_BYTES / 1024);
+    ESP_LOGI(TAG, "Ready — %d s max, input=knob button, target: %s",
+             RECORD_MAX_S, g_config.stream_recorder_url);
 
     while (1) {
-        // ── Wait for touch ────────────────────────────────────────────────────
-        uint16_t tx, ty;
-        while (!touch_get_point(&tx, &ty)) {
-            vTaskDelay(pdMS_TO_TICKS(50));
+        // ── Wait for knob button press ───────────────────────────────────────
+        while (!knob_btn_pressed()) {
+            vTaskDelay(pdMS_TO_TICKS(30));
         }
 
         // Ignore while audio is playing or another record is in progress
         EventBits_t bits = xEventGroupGetBits(g_events);
         if (bits & (EVT_AUDIO_PLAYING | EVT_AUDIO_RECORDING)) {
-            while (touch_get_point(&tx, &ty)) vTaskDelay(pdMS_TO_TICKS(50));
+            // Wait for button release before looping
+            while (knob_btn_pressed()) vTaskDelay(pdMS_TO_TICKS(30));
             continue;
         }
 
         // Need a linked chat to send to
         if (strlen(g_config.chat_id) == 0) {
-            ESP_LOGW(TAG, "No chat linked, ignoring touch");
-            while (touch_get_point(&tx, &ty)) vTaskDelay(pdMS_TO_TICKS(50));
+            ESP_LOGW(TAG, "No chat linked, ignoring knob press");
+            while (knob_btn_pressed()) vTaskDelay(pdMS_TO_TICKS(30));
             continue;
         }
 
-        // ── Record until touch released or buffer full ────────────────────────
-        ESP_LOGI(TAG, "Recording...");
+        // ── Record while button is held ──────────────────────────────────────
+        ESP_LOGI(TAG, "Recording (button held)...");
         display_set_state(DISPLAY_STATE_RECORDING, "Recording...\nRelease to send");
         xEventGroupSetBits(g_events, EVT_AUDIO_RECORDING);
         i2s_rx_start();
@@ -303,7 +337,7 @@ static void record_task(void *arg)
 
         size_t total = 0;
         while (total < RECORD_BUF_BYTES) {
-            if (!touch_get_point(&tx, &ty)) break;
+            if (!knob_btn_pressed()) break;  // released → stop
             size_t got = 0;
             i2s_channel_read(s_rx_chan, pcm_buf + total,
                              1024, &got, pdMS_TO_TICKS(200));
@@ -313,9 +347,6 @@ static void record_task(void *arg)
         i2s_rx_stop();
         xEventGroupClearBits(g_events, EVT_AUDIO_RECORDING);
 
-        // Drain any late-release touch events
-        while (touch_get_point(&tx, &ty)) vTaskDelay(pdMS_TO_TICKS(50));
-
         // I2S DMA captures interleaved L+R even in MONO mode.
         // Mic audio is on the right channel; downsample to true mono.
         {
@@ -323,7 +354,7 @@ static void record_task(void *arg)
             size_t n_stereo = total / 2;
             size_t n_mono   = n_stereo / 2;
             for (size_t i = 0; i < n_mono; i++) {
-                s[i] = s[i * 2 + 1];  // right channel (try R first)
+                s[i] = s[i * 2 + 1];  // right channel
             }
             total = n_mono * 2;
         }
@@ -331,17 +362,16 @@ static void record_task(void *arg)
         float duration_s = (float)total / (SAMPLE_RATE * 2);
         ESP_LOGI(TAG, "Captured %.1f s (%zu bytes, mono)", duration_s, total);
 
-        // Discard presses shorter than 0.5 s
-        // SAMPLE_RATE bytes = 16000 = 0.5 s of mono 16-bit at 16 kHz
+        // Discard recordings shorter than 0.5 s
         if (total < SAMPLE_RATE) {
             ESP_LOGW(TAG, "Too short, discarding");
             restore_idle_display();
             continue;
         }
 
-        // ── Upload ────────────────────────────────────────────────────────────
+        // ── Upload to stream-recorder ─────────────────────────────────────────
         display_set_state(DISPLAY_STATE_PROCESSING, "Sending...");
-        upload_audio(pcm_buf, total);
+        upload_to_stream_recorder(pcm_buf, total);
         restore_idle_display();
     }
 }
@@ -350,7 +380,6 @@ static void record_task(void *arg)
 
 void record_init(void)
 {
-    // Pinned to Core 1 alongside LED and audio tasks
-    xTaskCreatePinnedToCore(record_task, "record", 6144, NULL, 4, NULL, 1);
+    xTaskCreatePinnedToCore(record_task, "record", 8192, NULL, 4, NULL, 1);
     ESP_LOGI(TAG, "Record task spawned");
 }

@@ -95,12 +95,12 @@ static void lcd_power_on(void)
 
     // Configure port 1 (pins 8-15) as outputs
     uint8_t config_cmd[] = { PCA9535_CONFIG1, 0x00 };
-    i2c_master_write_to_device(AUDIO_I2C_PORT, IO_EXP_PWR_ADDR,
+    i2c_master_write_to_device(AUDIO_I2C_PORT, IO_EXP_ADDR,
         config_cmd, sizeof(config_cmd), pdMS_TO_TICKS(100));
 
     // Set all port-1 outputs HIGH (pin 9 = BSP_PWR_LCD)
     uint8_t output_cmd[] = { PCA9535_OUTPUT1, 0xFF };
-    i2c_master_write_to_device(AUDIO_I2C_PORT, IO_EXP_PWR_ADDR,
+    i2c_master_write_to_device(AUDIO_I2C_PORT, IO_EXP_ADDR,
         output_cmd, sizeof(output_cmd), pdMS_TO_TICKS(100));
 
     ESP_LOGI(TAG, "LCD power ON (IO expander 0x21 pin 9)");

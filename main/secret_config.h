@@ -28,3 +28,7 @@
 #ifndef SECRET_MQTT_URL
 #define SECRET_MQTT_URL "mqtt://api.cipherdolls.com:1883"
 #endif
+
+#ifndef SECRET_STREAM_RECORDER_URL
+#define SECRET_STREAM_RECORDER_URL "http://stream-recorder.cipherdolls.com"
+#endif

@@ -41,7 +41,7 @@ static bool is_charging(void)
 {
     uint8_t reg = PCA9535_INPUT0;
     uint8_t val = 0xFF;
-    i2c_master_write_read_device(AUDIO_I2C_PORT, IO_EXP_PWR_ADDR,
+    i2c_master_write_read_device(AUDIO_I2C_PORT, IO_EXP_ADDR,
                                   &reg, 1, &val, 1, pdMS_TO_TICKS(50));
     // Bit 0 (CHRG_DET) low = charging, Bit 1 (STDBY_DET) low = full
     bool charging = !(val & (1 << PWR_CHRG_DET_BIT));
@@ -80,9 +80,9 @@ void battery_init(void)
     };
     ESP_ERROR_CHECK(adc_cali_create_scheme_curve_fitting(&cali_cfg, &s_cali));
 
-    // Configure IO expander port 0 pins 0-2 as inputs for power status
-    uint8_t cmd[] = { PCA9535_CONFIG0, 0x07 };  // bits 0-2 = input
-    i2c_master_write_to_device(AUDIO_I2C_PORT, IO_EXP_PWR_ADDR,
+    // Configure IO expander port 0 as all inputs (power status bits 0-2, knob btn bit 3)
+    uint8_t cmd[] = { PCA9535_CONFIG0, 0xFF };
+    i2c_master_write_to_device(AUDIO_I2C_PORT, IO_EXP_ADDR,
                                 cmd, sizeof(cmd), pdMS_TO_TICKS(100));
 
     // First reading immediately
