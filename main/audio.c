@@ -38,7 +38,7 @@ static int16_t   *s_stereo = NULL;  // mono→stereo expansion buffer (same size
 static StaticTask_t s_audio_tcb;
 
 #define AUDIO_MSG_ID_MAX  80
-#define AUDIO_DL_MAX      (512 * 1024)   // 512 KB — enough for ~30 s of TTS at 128 kbps
+#define STREAM_BUF_SIZE   8192   // MP3 accumulation buffer (enough for several frames)
 
 typedef struct {
     char message_id[AUDIO_MSG_ID_MAX];
@@ -113,97 +113,97 @@ static void i2s_stop_ch(void)
     }
 }
 
-// ── HTTP download ─────────────────────────────────────────────────────────────
+// ── Stream-decode: download MP3 + decode + play simultaneously ────────────────
+// Opens HTTP GET, reads chunks into a small buffer, decodes MP3 frames as they
+// arrive, and plays them via I2S immediately.  No waiting for the full download.
 
-typedef struct { uint8_t *buf; size_t cap; size_t len; } dl_ctx_t;
-
-static esp_err_t dl_event(esp_http_client_event_t *evt)
+static void stream_play_mp3(const char *message_id)
 {
-    dl_ctx_t *d = (dl_ctx_t *)evt->user_data;
-    if (evt->event_id == HTTP_EVENT_ON_DATA && d) {
-        size_t space = d->cap - d->len;
-        size_t copy  = (size_t)evt->data_len < space ? (size_t)evt->data_len : space;
-        memcpy(d->buf + d->len, evt->data, copy);
-        d->len += copy;
-    }
-    return ESP_OK;
-}
-
-static size_t download_mp3(const char *message_id, uint8_t **out)
-{
-    // Prefer PSRAM; fall back to internal heap for small boards
-    uint8_t *buf = heap_caps_malloc(AUDIO_DL_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!buf) buf = malloc(64 * 1024);
-    if (!buf) { ESP_LOGE(TAG, "No memory for download"); return 0; }
-
-    dl_ctx_t ctx = { .buf = buf, .cap = AUDIO_DL_MAX, .len = 0 };
+    uint8_t *sbuf = heap_caps_malloc(STREAM_BUF_SIZE,
+                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!sbuf) { ESP_LOGE(TAG, "No memory for stream buffer"); return; }
 
     char url[256], auth[128];
-    snprintf(url,  sizeof(url),  "%s/messages/%s/audio", g_config.server_url, message_id);
+    snprintf(url,  sizeof(url),  "%s/messages/%s/audio",
+             g_config.server_url, message_id);
     snprintf(auth, sizeof(auth), "Bearer %s", g_config.apikey);
 
     esp_http_client_config_t cfg = {
         .url               = url,
         .crt_bundle_attach = esp_crt_bundle_attach,
-        .event_handler     = dl_event,
-        .user_data         = &ctx,
         .buffer_size       = 4096,
         .timeout_ms        = 20000,
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     esp_http_client_set_header(client, "Authorization", auth);
 
-    int status = -1;
-    if (esp_http_client_perform(client) == ESP_OK)
-        status = esp_http_client_get_status_code(client);
-    esp_http_client_cleanup(client);
+    bool i2s_started = false;
 
-    if (status != 200 || ctx.len == 0) {
-        ESP_LOGE(TAG, "Download failed status=%d len=%zu", status, ctx.len);
-        free(buf);
-        return 0;
+    if (esp_http_client_open(client, 0) != ESP_OK) {
+        ESP_LOGE(TAG, "HTTP open failed for %s", message_id);
+        goto cleanup;
     }
 
-    ESP_LOGI(TAG, "Downloaded %zu B for msg %s", ctx.len, message_id);
-    *out = buf;
-    return ctx.len;
-}
+    esp_http_client_fetch_headers(client);
+    int status = esp_http_client_get_status_code(client);
+    if (status != 200) {
+        ESP_LOGE(TAG, "HTTP %d for %s", status, message_id);
+        goto cleanup;
+    }
 
-// ── MP3 decode + I2S playback ─────────────────────────────────────────────────
+    ESP_LOGI(TAG, "Streaming MP3 for msg %s", message_id);
 
-static void play_mp3(const uint8_t *data, size_t len)
-{
-    mp3dec_frame_info_t info = {};
     mp3dec_init(s_dec);
-
-    const uint8_t *ptr     = data;
-    size_t         rem     = len;
-    bool           started = false;
-
     s_stop = false;
     xEventGroupSetBits(g_events, EVT_AUDIO_PLAYING);
     display_set_state(DISPLAY_STATE_PLAYING, "Playing...");
 
-    while (rem > 0 && !s_stop) {
-        int samples = mp3dec_decode_frame(s_dec, ptr, (int)rem, s_pcm, &info);
+    size_t buf_fill = 0;
+    bool   http_done = false;
 
-        if (info.frame_bytes == 0) break;   // corrupt or end of stream
-        ptr += info.frame_bytes;
-        rem -= info.frame_bytes;
-
-        if (samples <= 0) continue;         // ID3 / padding frame
-
-        // Init I2S once we know the sample rate from the first decoded frame
-        if (!started) {
-            i2s_start(info.hz);
-            started = true;
+    while (!s_stop) {
+        // ── Fill buffer from HTTP ────────────────────────────────────────────
+        if (!http_done && buf_fill < STREAM_BUF_SIZE) {
+            int rd = esp_http_client_read(client,
+                        (char *)(sbuf + buf_fill),
+                        STREAM_BUF_SIZE - buf_fill);
+            if (rd > 0) {
+                buf_fill += rd;
+            } else {
+                http_done = true;
+            }
         }
 
+        if (buf_fill == 0) break;
+
+        // ── Decode one MP3 frame ─────────────────────────────────────────────
+        mp3dec_frame_info_t info = {};
+        int samples = mp3dec_decode_frame(s_dec, sbuf, (int)buf_fill,
+                                           s_pcm, &info);
+
+        if (info.frame_bytes == 0) {
+            if (http_done) break;   // no more data, no more frames
+            continue;               // need more data from network
+        }
+
+        // Consume decoded bytes
+        buf_fill -= info.frame_bytes;
+        if (buf_fill > 0)
+            memmove(sbuf, sbuf + info.frame_bytes, buf_fill);
+
+        if (samples <= 0) continue;  // ID3 / padding frame
+
+        // Init I2S once we know the sample rate from the first decoded frame
+        if (!i2s_started) {
+            i2s_start(info.hz);
+            i2s_started = true;
+        }
+
+        // ── Play decoded PCM ─────────────────────────────────────────────────
         int16_t *out   = s_pcm;
         size_t   bytes = (size_t)samples * info.channels * sizeof(int16_t);
 
         if (info.channels == 1) {
-            // Expand mono → interleaved stereo so I2S slot is happy
             for (int i = 0; i < samples; i++) {
                 s_stereo[i * 2]     = s_pcm[i];
                 s_stereo[i * 2 + 1] = s_pcm[i];
@@ -216,14 +216,14 @@ static void play_mp3(const uint8_t *data, size_t len)
         i2s_channel_write(s_tx_chan, out, bytes, &written, pdMS_TO_TICKS(2000));
     }
 
-    if (started) {
+    if (i2s_started) {
         vTaskDelay(pdMS_TO_TICKS(150));  // let DMA drain
         i2s_stop_ch();
     }
 
     xEventGroupClearBits(g_events, EVT_AUDIO_PLAYING);
 
-    // Restore display to doll/chat ID view
+    // Restore display
     char msg[128];
     if (strlen(g_config.chat_id) > 0) {
         snprintf(msg, sizeof(msg), "Doll ID:\n%.36s\nChat ID:\n%.36s",
@@ -233,6 +233,11 @@ static void play_mp3(const uint8_t *data, size_t len)
                  g_config.doll_id);
     }
     display_set_state(DISPLAY_STATE_WIFI_OK, msg);
+
+cleanup:
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    free(sbuf);
 }
 
 // ── Play task ─────────────────────────────────────────────────────────────────
@@ -242,13 +247,7 @@ static void audio_play_task(void *arg)
     play_req_t req;
     while (1) {
         if (xQueueReceive(s_queue, &req, portMAX_DELAY) != pdTRUE) continue;
-
-        uint8_t *buf = NULL;
-        size_t   len = download_mp3(req.message_id, &buf);
-        if (len > 0 && buf) {
-            play_mp3(buf, len);
-        }
-        free(buf);
+        stream_play_mp3(req.message_id);
     }
 }
 
