@@ -289,3 +289,17 @@ void audio_stop(void)
 {
     s_stop = true;
 }
+
+void audio_speaker_mute(void)
+{
+    if (s_codec) {
+        es8311_voice_mute(s_codec, true);
+    }
+}
+
+void audio_speaker_unmute(void)
+{
+    if (s_codec) {
+        es8311_voice_mute(s_codec, false);
+    }
+}
