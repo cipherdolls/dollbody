@@ -5,7 +5,7 @@
 #include "display.h"
 #include "touch.h"
 #include "esp_log.h"
-#include "esp_http_client.h"
+#include "esp_websocket_client.h"
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
 #include "driver/i2s_std.h"
@@ -20,7 +20,7 @@ static const char *TAG = "record";
 
 #define SAMPLE_RATE      16000
 #define RECORD_MAX_S     20
-#define RECORD_BUF_BYTES (RECORD_MAX_S * SAMPLE_RATE * 2)   // 640 KB (mono, 16-bit)
+#define I2S_READ_BYTES   2048   // stereo read buffer per iteration
 
 #define ES7243_ADDR  0x14   // Confirmed by I2C scan on SenseCAP Watcher
 
@@ -202,66 +202,32 @@ static void i2s_rx_stop(void)
     }
 }
 
-// ── Upload WAV to stream-recorder ────────────────────────────────────────────
-// POST /stream?chatId=... with raw WAV body (no multipart).
-// Stream-recorder converts WAV→MP3 and forwards to the backend.
+// ── WebSocket event helpers ──────────────────────────────────────────────────
 
-static void upload_to_stream_recorder(const uint8_t *pcm, size_t pcm_bytes)
+static EventGroupHandle_t s_ws_events;
+#define WS_EVT_CONNECTED   (1 << 0)
+#define WS_EVT_CLOSED      (1 << 1)
+#define WS_EVT_ERROR       (1 << 2)
+
+static void ws_event_handler(void *arg, esp_event_base_t base,
+                             int32_t event_id, void *event_data)
 {
-    wav_hdr_t hdr;
-    build_wav_header(&hdr, pcm_bytes);
-
-    int total_len = (int)sizeof(wav_hdr_t) + (int)pcm_bytes;
-
-    char url[256], auth[128];
-    snprintf(url,  sizeof(url),  "%s/stream?chatId=%s",
-             g_config.stream_recorder_url, g_config.chat_id);
-    snprintf(auth, sizeof(auth), "Bearer %s", g_config.apikey);
-
-    esp_http_client_config_t cfg = {
-        .url               = url,
-        .method            = HTTP_METHOD_POST,
-        .timeout_ms        = 30000,
-    };
-    if (strncmp(g_config.stream_recorder_url, "https", 5) == 0) {
-        cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    switch (event_id) {
+    case WEBSOCKET_EVENT_CONNECTED:
+        ESP_LOGI(TAG, "WS connected");
+        xEventGroupSetBits(s_ws_events, WS_EVT_CONNECTED);
+        break;
+    case WEBSOCKET_EVENT_DISCONNECTED:
+        ESP_LOGI(TAG, "WS disconnected");
+        xEventGroupSetBits(s_ws_events, WS_EVT_CLOSED);
+        break;
+    case WEBSOCKET_EVENT_ERROR:
+        ESP_LOGE(TAG, "WS error");
+        xEventGroupSetBits(s_ws_events, WS_EVT_ERROR);
+        break;
+    default:
+        break;
     }
-
-    esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    esp_http_client_set_header(client, "Authorization", auth);
-    esp_http_client_set_header(client, "Content-Type", "audio/wav");
-
-    ESP_LOGI(TAG, "POST %s (%d bytes)", url, total_len);
-
-    if (esp_http_client_open(client, total_len) != ESP_OK) {
-        ESP_LOGE(TAG, "HTTP open failed");
-        esp_http_client_cleanup(client);
-        return;
-    }
-
-    // WAV header
-    esp_http_client_write(client, (const char *)&hdr, sizeof(wav_hdr_t));
-
-    // PCM data in 4 KB chunks
-    size_t off = 0;
-    while (off < pcm_bytes) {
-        size_t n = pcm_bytes - off;
-        if (n > 4096) n = 4096;
-        esp_http_client_write(client, (const char *)(pcm + off), n);
-        off += n;
-    }
-
-    esp_http_client_fetch_headers(client);
-    int status = esp_http_client_get_status_code(client);
-    if (status >= 200 && status < 300) {
-        ESP_LOGI(TAG, "Upload OK (%d) — %.1f s, %zu B",
-                 status, (float)pcm_bytes / (SAMPLE_RATE * 2), pcm_bytes);
-    } else {
-        ESP_LOGW(TAG, "Upload failed — HTTP %d", status);
-    }
-
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
 }
 
 // ── Display helper ────────────────────────────────────────────────────────────
@@ -279,7 +245,10 @@ static void restore_idle_display(void)
     display_set_state(DISPLAY_STATE_WIFI_OK, msg);
 }
 
-// ── Record task — hold knob button to record, release to send ────────────────
+// ── Record task — true streaming: record + send simultaneously ───────────────
+// On button press: open WS → send WAV header → start I2S → stream chunks.
+// On button release: stop I2S → close WS (triggers server-side processing).
+// No large PSRAM buffer needed — only a small I2S read buffer.
 
 static void record_task(void *arg)
 {
@@ -289,15 +258,14 @@ static void record_task(void *arg)
     // Configure knob button on IO expander
     knob_init();
 
-    uint8_t *pcm_buf = heap_caps_malloc(RECORD_BUF_BYTES,
-                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!pcm_buf) {
-        ESP_LOGE(TAG, "Failed to allocate %d KB recording buffer",
-                 RECORD_BUF_BYTES / 1024);
+    // Small buffer for I2S reads — no PSRAM needed
+    uint8_t *i2s_buf = malloc(I2S_READ_BYTES);
+    if (!i2s_buf) {
+        ESP_LOGE(TAG, "Failed to allocate %d byte I2S buffer", I2S_READ_BYTES);
         vTaskDelete(NULL);
         return;
     }
-    ESP_LOGI(TAG, "Ready — %d s max, input=knob button, target: %s",
+    ESP_LOGI(TAG, "Ready — %d s max, input=knob button, streaming to: %s",
              RECORD_MAX_S, g_config.stream_recorder_url);
 
     while (1) {
@@ -309,7 +277,6 @@ static void record_task(void *arg)
         // Ignore while audio is playing or another record is in progress
         EventBits_t bits = xEventGroupGetBits(g_events);
         if (bits & (EVT_AUDIO_PLAYING | EVT_AUDIO_RECORDING)) {
-            // Wait for button release before looping
             while (knob_btn_pressed()) vTaskDelay(pdMS_TO_TICKS(30));
             continue;
         }
@@ -321,57 +288,116 @@ static void record_task(void *arg)
             continue;
         }
 
-        // ── Record while button is held ──────────────────────────────────────
-        ESP_LOGI(TAG, "Recording (button held)...");
-        display_set_state(DISPLAY_STATE_RECORDING, "Recording...\nRelease to send");
+        // ── Open WebSocket connection ────────────────────────────────────────
+        ESP_LOGI(TAG, "Connecting to stream-recorder...");
+        display_set_state(DISPLAY_STATE_RECORDING, "Connecting...");
         xEventGroupSetBits(g_events, EVT_AUDIO_RECORDING);
-        i2s_rx_start();
 
-        // ES7243E is I2S slave — it needs MCLK from the ESP32 to configure its
-        // internal PLL.  Init here (after MCLK is running) on the first use only.
+        // Build WS URL: convert https:// → wss:// (or http:// → ws://)
+        char url[384];
+        if (strncmp(g_config.stream_recorder_url, "https://", 8) == 0) {
+            snprintf(url, sizeof(url), "wss://%s/ws-stream?chatId=%s&auth=%s",
+                     g_config.stream_recorder_url + 8, g_config.chat_id, g_config.apikey);
+        } else if (strncmp(g_config.stream_recorder_url, "http://", 7) == 0) {
+            snprintf(url, sizeof(url), "ws://%s/ws-stream?chatId=%s&auth=%s",
+                     g_config.stream_recorder_url + 7, g_config.chat_id, g_config.apikey);
+        } else {
+            snprintf(url, sizeof(url), "ws://%s/ws-stream?chatId=%s&auth=%s",
+                     g_config.stream_recorder_url, g_config.chat_id, g_config.apikey);
+        }
+
+        s_ws_events = xEventGroupCreate();
+        esp_websocket_client_config_t ws_cfg = { .uri = url };
+        if (strncmp(url, "wss://", 6) == 0) {
+            ws_cfg.crt_bundle_attach = esp_crt_bundle_attach;
+        }
+
+        esp_websocket_client_handle_t client = esp_websocket_client_init(&ws_cfg);
+        esp_websocket_register_events(client, WEBSOCKET_EVENT_ANY,
+                                       ws_event_handler, NULL);
+        esp_websocket_client_start(client);
+
+        bits = xEventGroupWaitBits(s_ws_events,
+            WS_EVT_CONNECTED | WS_EVT_ERROR,
+            pdTRUE, pdFALSE, pdMS_TO_TICKS(10000));
+
+        if (!(bits & WS_EVT_CONNECTED)) {
+            ESP_LOGE(TAG, "WS connect failed");
+            esp_websocket_client_destroy(client);
+            vEventGroupDelete(s_ws_events);
+            xEventGroupClearBits(g_events, EVT_AUDIO_RECORDING);
+            restore_idle_display();
+            while (knob_btn_pressed()) vTaskDelay(pdMS_TO_TICKS(30));
+            continue;
+        }
+
+        // ── Send WAV header (max size — ffmpeg handles truncated data) ───────
+        wav_hdr_t hdr;
+        build_wav_header(&hdr, RECORD_MAX_S * SAMPLE_RATE * 2);
+        esp_websocket_client_send_bin(client, (const char *)&hdr,
+                                      sizeof(wav_hdr_t), pdMS_TO_TICKS(5000));
+
+        // ── Start I2S + mic ──────────────────────────────────────────────────
+        i2s_rx_start();
         if (!s_mic_init) {
-            vTaskDelay(pdMS_TO_TICKS(50));  // let MCLK stabilise
+            vTaskDelay(pdMS_TO_TICKS(50));
             es7243e_init();
             s_mic_init = true;
         }
 
-        size_t total = 0;
-        while (total < RECORD_BUF_BYTES) {
-            if (!knob_btn_pressed()) break;  // released → stop
+        display_set_state(DISPLAY_STATE_RECORDING, "Recording...\nRelease to stop");
+        ESP_LOGI(TAG, "Streaming audio...");
+
+        // ── Stream loop: read I2S → downsample → send via WS ────────────────
+        size_t total_mono = 0;
+        size_t max_mono = RECORD_MAX_S * SAMPLE_RATE * 2;
+        bool ws_ok = true;
+
+        while (total_mono < max_mono) {
+            if (!knob_btn_pressed()) break;
+
             size_t got = 0;
-            i2s_channel_read(s_rx_chan, pcm_buf + total,
-                             1024, &got, pdMS_TO_TICKS(200));
-            total += got;
+            i2s_channel_read(s_rx_chan, i2s_buf, I2S_READ_BYTES,
+                             &got, pdMS_TO_TICKS(200));
+            if (got == 0) continue;
+
+            // Downsample stereo→mono in-place (keep right channel)
+            int16_t *s = (int16_t *)i2s_buf;
+            size_t n_stereo_samples = got / 2;   // total int16 samples
+            size_t n_mono_samples   = n_stereo_samples / 2;
+            for (size_t i = 0; i < n_mono_samples; i++) {
+                s[i] = s[i * 2 + 1];  // right channel
+            }
+            size_t mono_bytes = n_mono_samples * 2;
+
+            // Send mono chunk via WebSocket
+            int sent = esp_websocket_client_send_bin(client,
+                (const char *)i2s_buf, mono_bytes, pdMS_TO_TICKS(5000));
+            if (sent < 0) {
+                ESP_LOGE(TAG, "WS send failed at %zu bytes", total_mono);
+                ws_ok = false;
+                break;
+            }
+            total_mono += mono_bytes;
         }
 
+        // ── Stop recording ───────────────────────────────────────────────────
         i2s_rx_stop();
         xEventGroupClearBits(g_events, EVT_AUDIO_RECORDING);
 
-        // I2S DMA captures interleaved L+R even in MONO mode.
-        // Mic audio is on the right channel; downsample to true mono.
-        {
-            int16_t *s = (int16_t *)pcm_buf;
-            size_t n_stereo = total / 2;
-            size_t n_mono   = n_stereo / 2;
-            for (size_t i = 0; i < n_mono; i++) {
-                s[i] = s[i * 2 + 1];  // right channel
-            }
-            total = n_mono * 2;
+        float dur = (float)total_mono / (SAMPLE_RATE * 2);
+        ESP_LOGI(TAG, "Streamed %.1f s (%zu B mono)", dur, total_mono);
+
+        // Close WS — triggers server-side WAV→MP3 conversion + forwarding
+        esp_websocket_client_close(client, pdMS_TO_TICKS(5000));
+        esp_websocket_client_destroy(client);
+        vEventGroupDelete(s_ws_events);
+
+        if (!ws_ok || total_mono < SAMPLE_RATE) {
+            if (total_mono < SAMPLE_RATE)
+                ESP_LOGW(TAG, "Too short (%.1f s), discarded by server", dur);
         }
 
-        float duration_s = (float)total / (SAMPLE_RATE * 2);
-        ESP_LOGI(TAG, "Captured %.1f s (%zu bytes, mono)", duration_s, total);
-
-        // Discard recordings shorter than 0.5 s
-        if (total < SAMPLE_RATE) {
-            ESP_LOGW(TAG, "Too short, discarding");
-            restore_idle_display();
-            continue;
-        }
-
-        // ── Upload to stream-recorder ─────────────────────────────────────────
-        display_set_state(DISPLAY_STATE_PROCESSING, "Sending...");
-        upload_to_stream_recorder(pcm_buf, total);
         restore_idle_display();
     }
 }
