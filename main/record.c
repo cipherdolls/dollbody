@@ -1,4 +1,5 @@
 #include "record.h"
+#include "audio.h"
 #include "board.h"
 #include "config.h"
 #include "events.h"
@@ -13,6 +14,7 @@
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/stream_buffer.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -20,13 +22,26 @@ static const char *TAG = "record";
 
 #define SAMPLE_RATE      16000
 #define RECORD_MAX_S     20
-#define I2S_READ_BYTES   2048   // stereo read buffer per iteration
-#define PREBUF_BYTES     (SAMPLE_RATE * 2 * 3)  // 3 seconds mono @ 16kHz 16-bit = 96 KB
+#define I2S_READ_BYTES   2048           // stereo read buffer per iteration
+#define RING_BUF_BYTES   (128 * 1024)   // 128 KB ring buffer in PSRAM (~4 s audio)
+#define SEND_CHUNK       4096           // 4 KB per WS send
 
 #define ES7243_ADDR  0x14   // Confirmed by I2C scan on SenseCAP Watcher
 
 static i2s_chan_handle_t s_rx_chan  = NULL;
 static bool             s_mic_init = false;
+
+// ── Ring buffer for Core 0 → Core 1 audio transfer ─────────────────────────
+
+static StreamBufferHandle_t s_ring_buf;
+static StaticStreamBuffer_t s_ring_struct;
+static uint8_t             *s_ring_storage;
+static volatile bool        s_reader_running;
+
+// Reader task stack in PSRAM (keeps internal heap free for TLS)
+#define READER_STACK_WORDS 2048   // 2048 words = 8 KB stack
+static StackType_t         *s_reader_stack;
+static StaticTask_t         s_reader_tcb;
 
 // ── WAV header ────────────────────────────────────────────────────────────────
 
@@ -126,10 +141,8 @@ static void es7243e_init(void)
 }
 
 // ── Knob button — press to record, release to send ──────────────────────────
-// Button is on PCA9535 IO expander at 0x21 (IO_EXP_ADDR), port 0, pin 3.
-// Active low — pressed = bit clear.
 
-static bool s_knob_btn_ok = false;   // set true once first read succeeds
+static bool s_knob_btn_ok = false;
 
 static bool knob_btn_pressed(void)
 {
@@ -149,12 +162,11 @@ static bool knob_btn_pressed(void)
         ESP_LOGI(TAG, "Knob IO expander 0x%02X responding, port0=0x%02X",
                  IO_EXP_ADDR, val);
     }
-    return !(val & (1 << KNOB_BTN_BIT));   // active low
+    return !(val & (1 << KNOB_BTN_BIT));
 }
 
 static void knob_init(void)
 {
-    // Configure port 0 pin 3 as input on the knob IO expander
     uint8_t cmd[] = { PCA9535_CONFIG0, (1 << KNOB_BTN_BIT) };
     esp_err_t err = i2c_master_write_to_device(
         AUDIO_I2C_PORT, IO_EXP_ADDR,
@@ -246,31 +258,61 @@ static void restore_idle_display(void)
     display_set_state(DISPLAY_STATE_WIFI_OK, msg);
 }
 
-// ── Record task — true streaming with pre-buffering ──────────────────────────
-// On button press: start I2S immediately into a pre-buffer while WSS connects.
-// Once connected: flush pre-buffer → continue streaming live.
-// On button release: stop I2S → close WS (triggers server-side processing).
+// ── I2S reader task — runs on Core 0, feeds ring buffer ─────────────────────
 
-static void record_task(void *arg)
+static void i2s_reader_task(void *arg)
 {
-    // touch_init() blocks ~3 s for the SPD2010 BIOS→CPU firmware transition
-    touch_init();
-
-    // Configure knob button on IO expander
-    knob_init();
-
-    // Small buffer for I2S reads
-    uint8_t *i2s_buf = malloc(I2S_READ_BYTES);
-    // Pre-buffer in PSRAM to capture audio during TLS handshake (~1-2 s)
-    uint8_t *prebuf = heap_caps_malloc(PREBUF_BYTES,
-                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!i2s_buf || !prebuf) {
-        ESP_LOGE(TAG, "Failed to allocate record buffers");
+    uint8_t *buf = heap_caps_malloc(I2S_READ_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) {
+        ESP_LOGE(TAG, "i2s_reader: malloc failed");
+        s_reader_running = false;
         vTaskDelete(NULL);
         return;
     }
-    ESP_LOGI(TAG, "Ready — %d s max, %d KB pre-buffer, streaming to: %s",
-             RECORD_MAX_S, PREBUF_BYTES / 1024, g_config.stream_recorder_url);
+
+    while (s_reader_running) {
+        size_t got = 0;
+        i2s_channel_read(s_rx_chan, buf, I2S_READ_BYTES, &got, pdMS_TO_TICKS(200));
+        if (got == 0) continue;
+
+        // Downsample stereo→mono in-place (keep right channel)
+        int16_t *s = (int16_t *)buf;
+        size_t n_mono = got / 4;
+        for (size_t i = 0; i < n_mono; i++) {
+            s[i] = s[i * 2 + 1];
+        }
+        size_t mono_bytes = n_mono * 2;
+
+        // Write to ring buffer — blocks briefly if full, drops data after 50 ms
+        xStreamBufferSend(s_ring_buf, buf, mono_bytes, pdMS_TO_TICKS(50));
+    }
+
+    heap_caps_free(buf);
+    ESP_LOGI(TAG, "I2S reader task exiting");
+    vTaskDelete(NULL);
+}
+
+// ── Record task — multicore: reader on Core 0, WS sender on Core 1 ─────────
+
+static void record_task(void *arg)
+{
+    touch_init();
+    knob_init();
+
+    // Allocate ring buffer + reader stack in PSRAM (once, reused across recordings)
+    s_ring_storage = heap_caps_malloc(RING_BUF_BYTES + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint8_t *send_buf = heap_caps_malloc(SEND_CHUNK, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_reader_stack = heap_caps_malloc(READER_STACK_WORDS * sizeof(StackType_t),
+                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_ring_storage || !send_buf || !s_reader_stack) {
+        ESP_LOGE(TAG, "Failed to allocate buffers");
+        vTaskDelete(NULL);
+        return;
+    }
+    s_ring_buf = xStreamBufferCreateStatic(RING_BUF_BYTES, 1, s_ring_storage, &s_ring_struct);
+
+    ESP_LOGI(TAG, "Ready — %d s max, %d KB ring buffer, streaming to: %s",
+             RECORD_MAX_S, RING_BUF_BYTES / 1024, g_config.stream_recorder_url);
 
     while (1) {
         // ── Wait for knob button press ───────────────────────────────────────
@@ -278,14 +320,11 @@ static void record_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(30));
         }
 
-        // Ignore while audio is playing or another record is in progress
         EventBits_t bits = xEventGroupGetBits(g_events);
         if (bits & (EVT_AUDIO_PLAYING | EVT_AUDIO_RECORDING)) {
             while (knob_btn_pressed()) vTaskDelay(pdMS_TO_TICKS(30));
             continue;
         }
-
-        // Need a linked chat to send to
         if (strlen(g_config.chat_id) == 0) {
             ESP_LOGW(TAG, "No chat linked, ignoring knob press");
             while (knob_btn_pressed()) vTaskDelay(pdMS_TO_TICKS(30));
@@ -294,8 +333,10 @@ static void record_task(void *arg)
 
         xEventGroupSetBits(g_events, EVT_AUDIO_RECORDING);
         display_set_state(DISPLAY_STATE_RECORDING, "Recording...");
+        audio_speaker_mute();
 
-        // ── Start I2S + mic IMMEDIATELY — capture audio while WS connects ───
+        // ── Start I2S + reader FIRST (pre-buffer while TLS handshakes) ──────
+        // Reader stack is in PSRAM → zero internal heap cost → TLS safe.
         i2s_rx_start();
         if (!s_mic_init) {
             vTaskDelay(pdMS_TO_TICKS(50));
@@ -303,10 +344,13 @@ static void record_task(void *arg)
             s_mic_init = true;
         }
 
-        // ── Pre-buffer: capture mono audio while WS handshake happens ────────
-        size_t prebuf_fill = 0;
+        xStreamBufferReset(s_ring_buf);
+        s_reader_running = true;
+        xTaskCreateStaticPinnedToCore(i2s_reader_task, "i2s_rd",
+            READER_STACK_WORDS, NULL, 5,
+            s_reader_stack, &s_reader_tcb, 0);
 
-        // Build WS URL: convert https:// → wss:// (or http:// → ws://)
+        // ── Connect WebSocket (reader pre-buffers audio during TLS) ─────────
         char url[384];
         if (strncmp(g_config.stream_recorder_url, "https://", 8) == 0) {
             snprintf(url, sizeof(url), "wss://%s/ws-stream?chatId=%s&auth=%s",
@@ -319,6 +363,9 @@ static void record_task(void *arg)
                      g_config.stream_recorder_url, g_config.chat_id, g_config.apikey);
         }
 
+        ESP_LOGI(TAG, "Free internal heap: %lu B, reader on Core 0, WS connecting...",
+                 (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+
         s_ws_events = xEventGroupCreate();
         esp_websocket_client_config_t ws_cfg = { .uri = url };
         if (strncmp(url, "wss://", 6) == 0) {
@@ -330,132 +377,105 @@ static void record_task(void *arg)
                                        ws_event_handler, NULL);
         esp_websocket_client_start(client);
 
-        // Record into pre-buffer while waiting for WS connection
-        ESP_LOGI(TAG, "Pre-buffering while WS connects...");
         bool ws_connected = false;
-        while (prebuf_fill < PREBUF_BYTES && knob_btn_pressed()) {
-            // Check if WS connected yet (non-blocking)
-            bits = xEventGroupWaitBits(s_ws_events,
-                WS_EVT_CONNECTED | WS_EVT_ERROR,
-                pdTRUE, pdFALSE, 0);
-            if (bits & (WS_EVT_CONNECTED | WS_EVT_ERROR)) {
-                ws_connected = !!(bits & WS_EVT_CONNECTED);
-                break;
+        bool header_sent  = false;
+        bool ws_ok        = true;
+        size_t total_mono = 0;
+        size_t max_mono   = RECORD_MAX_S * SAMPLE_RATE * 2;
+
+        // ── Main loop: wait for WS, then drain pre-buffered + live audio ────
+        // Core 0 reader fills ring buffer from I2S (including during TLS).
+        // Once WS connects, send WAV header then drain buffer + live data.
+        while (ws_ok && total_mono < max_mono && knob_btn_pressed()) {
+            if (!ws_connected) {
+                bits = xEventGroupWaitBits(s_ws_events,
+                    WS_EVT_CONNECTED | WS_EVT_ERROR, pdTRUE, pdFALSE, 0);
+                if (bits & WS_EVT_ERROR) { ws_ok = false; break; }
+                if (bits & WS_EVT_CONNECTED) {
+                    ws_connected = true;
+                    size_t prebuf = xStreamBufferBytesAvailable(s_ring_buf);
+                    ESP_LOGI(TAG, "WS connected, %zu bytes pre-buffered (%.1f s)",
+                             prebuf, (float)prebuf / (SAMPLE_RATE * 2));
+                    display_set_state(DISPLAY_STATE_RECORDING,
+                                      "Recording...\nRelease to stop");
+                }
             }
 
-            size_t got = 0;
-            i2s_channel_read(s_rx_chan, i2s_buf, I2S_READ_BYTES,
-                             &got, pdMS_TO_TICKS(200));
-            if (got == 0) continue;
-
-            // Downsample stereo→mono in-place (keep right channel)
-            int16_t *s = (int16_t *)i2s_buf;
-            size_t n_stereo = got / 2;
-            size_t n_mono   = n_stereo / 2;
-            for (size_t i = 0; i < n_mono; i++) {
-                s[i] = s[i * 2 + 1];
+            if (!ws_connected) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
             }
-            size_t mono_bytes = n_mono * 2;
-            size_t to_copy = mono_bytes;
-            if (prebuf_fill + to_copy > PREBUF_BYTES)
-                to_copy = PREBUF_BYTES - prebuf_fill;
-            memcpy(prebuf + prebuf_fill, i2s_buf, to_copy);
-            prebuf_fill += to_copy;
+
+            if (!header_sent) {
+                wav_hdr_t hdr;
+                build_wav_header(&hdr, max_mono);
+                esp_websocket_client_send_bin(client, (const char *)&hdr,
+                    sizeof(wav_hdr_t), pdMS_TO_TICKS(5000));
+                header_sent = true;
+            }
+
+            size_t got = xStreamBufferReceive(s_ring_buf, send_buf,
+                                               SEND_CHUNK, pdMS_TO_TICKS(100));
+            if (got > 0) {
+                int ret = esp_websocket_client_send_bin(client,
+                    (const char *)send_buf, got, pdMS_TO_TICKS(5000));
+                if (ret < 0) { ws_ok = false; break; }
+                total_mono += got;
+            }
         }
 
-        // If WS didn't connect during pre-buffer, wait a bit more
+        // ── Stop I2S reader ──────────────────────────────────────────────────
+        s_reader_running = false;
+        vTaskDelay(pdMS_TO_TICKS(300));  // wait for reader task to exit
+
+        // ── If WS never connected, try waiting (user may have released early) ─
         if (!ws_connected) {
             bits = xEventGroupWaitBits(s_ws_events,
                 WS_EVT_CONNECTED | WS_EVT_ERROR,
                 pdTRUE, pdFALSE, pdMS_TO_TICKS(8000));
             ws_connected = !!(bits & WS_EVT_CONNECTED);
+            if (ws_connected) {
+                size_t remaining = xStreamBufferBytesAvailable(s_ring_buf);
+                wav_hdr_t hdr;
+                build_wav_header(&hdr, remaining);
+                esp_websocket_client_send_bin(client, (const char *)&hdr,
+                    sizeof(wav_hdr_t), pdMS_TO_TICKS(5000));
+            }
         }
 
-        if (!ws_connected) {
-            ESP_LOGE(TAG, "WS connect failed");
-            i2s_rx_stop();
-            esp_websocket_client_destroy(client);
-            vEventGroupDelete(s_ws_events);
-            xEventGroupClearBits(g_events, EVT_AUDIO_RECORDING);
-            restore_idle_display();
-            while (knob_btn_pressed()) vTaskDelay(pdMS_TO_TICKS(30));
-            continue;
-        }
-
-        ESP_LOGI(TAG, "WS connected, flushing %zu bytes pre-buffer", prebuf_fill);
-
-        // ── Send WAV header + flush pre-buffer ──────────────────────────────
-        wav_hdr_t hdr;
-        build_wav_header(&hdr, RECORD_MAX_S * SAMPLE_RATE * 2);
-        esp_websocket_client_send_bin(client, (const char *)&hdr,
-                                      sizeof(wav_hdr_t), pdMS_TO_TICKS(5000));
-
-        bool ws_ok = true;
-        size_t total_mono = 0;
-
-        // Flush pre-buffer
-        if (prebuf_fill > 0) {
-            int sent = esp_websocket_client_send_bin(client,
-                (const char *)prebuf, prebuf_fill, pdMS_TO_TICKS(5000));
-            if (sent < 0) {
-                ESP_LOGE(TAG, "WS send pre-buffer failed");
-                ws_ok = false;
+        // ── Drain remaining ring buffer ──────────────────────────────────────
+        if (ws_connected) {
+            size_t got;
+            while ((got = xStreamBufferReceive(s_ring_buf, send_buf, SEND_CHUNK, 0)) > 0) {
+                esp_websocket_client_send_bin(client,
+                    (const char *)send_buf, got, pdMS_TO_TICKS(5000));
+                total_mono += got;
             }
-            total_mono += prebuf_fill;
-        }
-
-        display_set_state(DISPLAY_STATE_RECORDING, "Recording...\nRelease to stop");
-        ESP_LOGI(TAG, "Streaming audio...");
-
-        // ── Stream loop: read I2S → downsample → send via WS ────────────────
-        size_t max_mono = RECORD_MAX_S * SAMPLE_RATE * 2;
-
-        while (ws_ok && total_mono < max_mono) {
-            if (!knob_btn_pressed()) break;
-
-            size_t got = 0;
-            i2s_channel_read(s_rx_chan, i2s_buf, I2S_READ_BYTES,
-                             &got, pdMS_TO_TICKS(200));
-            if (got == 0) continue;
-
-            // Downsample stereo→mono in-place (keep right channel)
-            int16_t *s = (int16_t *)i2s_buf;
-            size_t n_stereo_samples = got / 2;
-            size_t n_mono_samples   = n_stereo_samples / 2;
-            for (size_t i = 0; i < n_mono_samples; i++) {
-                s[i] = s[i * 2 + 1];
-            }
-            size_t mono_bytes = n_mono_samples * 2;
-
-            int sent = esp_websocket_client_send_bin(client,
-                (const char *)i2s_buf, mono_bytes, pdMS_TO_TICKS(5000));
-            if (sent < 0) {
-                ESP_LOGE(TAG, "WS send failed at %zu bytes", total_mono);
-                ws_ok = false;
-                break;
-            }
-            total_mono += mono_bytes;
         }
 
         // ── Stop recording ───────────────────────────────────────────────────
         i2s_rx_stop();
+        audio_speaker_unmute();
         xEventGroupClearBits(g_events, EVT_AUDIO_RECORDING);
 
         float dur = (float)total_mono / (SAMPLE_RATE * 2);
-        ESP_LOGI(TAG, "Streamed %.1f s (%zu B mono, %zu pre-buffered)",
-                 dur, total_mono, prebuf_fill);
+        ESP_LOGI(TAG, "Streamed %.1f s (%zu B mono)", dur, total_mono);
 
-        // Close WS — triggers server-side WAV→MP3 conversion + forwarding
-        esp_websocket_client_close(client, pdMS_TO_TICKS(5000));
+        if (ws_connected) {
+            esp_websocket_client_close(client, pdMS_TO_TICKS(5000));
+        } else {
+            ESP_LOGE(TAG, "WS connect failed");
+        }
+
         esp_websocket_client_destroy(client);
         vEventGroupDelete(s_ws_events);
 
-        if (!ws_ok || total_mono < SAMPLE_RATE) {
-            if (total_mono < SAMPLE_RATE)
-                ESP_LOGW(TAG, "Too short (%.1f s), discarded by server", dur);
+        if (total_mono < SAMPLE_RATE) {
+            ESP_LOGW(TAG, "Too short (%.1f s), discarded by server", dur);
         }
 
         restore_idle_display();
+        while (knob_btn_pressed()) vTaskDelay(pdMS_TO_TICKS(30));
     }
 }
 
