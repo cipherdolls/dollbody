@@ -8,6 +8,6 @@ doll_config_t g_config = {
     .doll_body_id = "",
     .doll_id      = "",
     .server_url   = "https://api.cipherdolls.com",
-    .stream_recorder_url = "http://stream-recorder.cipherdolls.com",
+    .stream_recorder_url = "https://stream-recorder.cipherdolls.com",
     .provisioned = false,
 };

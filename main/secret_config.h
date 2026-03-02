@@ -30,5 +30,5 @@
 #endif
 
 #ifndef SECRET_STREAM_RECORDER_URL
-#define SECRET_STREAM_RECORDER_URL "http://stream-recorder.cipherdolls.com"
+#define SECRET_STREAM_RECORDER_URL "https://stream-recorder.cipherdolls.com"
 #endif

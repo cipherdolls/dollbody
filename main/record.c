@@ -21,6 +21,7 @@ static const char *TAG = "record";
 #define SAMPLE_RATE      16000
 #define RECORD_MAX_S     20
 #define I2S_READ_BYTES   2048   // stereo read buffer per iteration
+#define PREBUF_BYTES     (SAMPLE_RATE * 2 * 3)  // 3 seconds mono @ 16kHz 16-bit = 96 KB
 
 #define ES7243_ADDR  0x14   // Confirmed by I2C scan on SenseCAP Watcher
 
@@ -245,10 +246,10 @@ static void restore_idle_display(void)
     display_set_state(DISPLAY_STATE_WIFI_OK, msg);
 }
 
-// ── Record task — true streaming: record + send simultaneously ───────────────
-// On button press: open WS → send WAV header → start I2S → stream chunks.
+// ── Record task — true streaming with pre-buffering ──────────────────────────
+// On button press: start I2S immediately into a pre-buffer while WSS connects.
+// Once connected: flush pre-buffer → continue streaming live.
 // On button release: stop I2S → close WS (triggers server-side processing).
-// No large PSRAM buffer needed — only a small I2S read buffer.
 
 static void record_task(void *arg)
 {
@@ -258,15 +259,18 @@ static void record_task(void *arg)
     // Configure knob button on IO expander
     knob_init();
 
-    // Small buffer for I2S reads — no PSRAM needed
+    // Small buffer for I2S reads
     uint8_t *i2s_buf = malloc(I2S_READ_BYTES);
-    if (!i2s_buf) {
-        ESP_LOGE(TAG, "Failed to allocate %d byte I2S buffer", I2S_READ_BYTES);
+    // Pre-buffer in PSRAM to capture audio during TLS handshake (~1-2 s)
+    uint8_t *prebuf = heap_caps_malloc(PREBUF_BYTES,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!i2s_buf || !prebuf) {
+        ESP_LOGE(TAG, "Failed to allocate record buffers");
         vTaskDelete(NULL);
         return;
     }
-    ESP_LOGI(TAG, "Ready — %d s max, input=knob button, streaming to: %s",
-             RECORD_MAX_S, g_config.stream_recorder_url);
+    ESP_LOGI(TAG, "Ready — %d s max, %d KB pre-buffer, streaming to: %s",
+             RECORD_MAX_S, PREBUF_BYTES / 1024, g_config.stream_recorder_url);
 
     while (1) {
         // ── Wait for knob button press ───────────────────────────────────────
@@ -288,10 +292,19 @@ static void record_task(void *arg)
             continue;
         }
 
-        // ── Open WebSocket connection ────────────────────────────────────────
-        ESP_LOGI(TAG, "Connecting to stream-recorder...");
-        display_set_state(DISPLAY_STATE_RECORDING, "Connecting...");
         xEventGroupSetBits(g_events, EVT_AUDIO_RECORDING);
+        display_set_state(DISPLAY_STATE_RECORDING, "Recording...");
+
+        // ── Start I2S + mic IMMEDIATELY — capture audio while WS connects ───
+        i2s_rx_start();
+        if (!s_mic_init) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            es7243e_init();
+            s_mic_init = true;
+        }
+
+        // ── Pre-buffer: capture mono audio while WS handshake happens ────────
+        size_t prebuf_fill = 0;
 
         // Build WS URL: convert https:// → wss:// (or http:// → ws://)
         char url[384];
@@ -317,12 +330,50 @@ static void record_task(void *arg)
                                        ws_event_handler, NULL);
         esp_websocket_client_start(client);
 
-        bits = xEventGroupWaitBits(s_ws_events,
-            WS_EVT_CONNECTED | WS_EVT_ERROR,
-            pdTRUE, pdFALSE, pdMS_TO_TICKS(10000));
+        // Record into pre-buffer while waiting for WS connection
+        ESP_LOGI(TAG, "Pre-buffering while WS connects...");
+        bool ws_connected = false;
+        while (prebuf_fill < PREBUF_BYTES && knob_btn_pressed()) {
+            // Check if WS connected yet (non-blocking)
+            bits = xEventGroupWaitBits(s_ws_events,
+                WS_EVT_CONNECTED | WS_EVT_ERROR,
+                pdTRUE, pdFALSE, 0);
+            if (bits & (WS_EVT_CONNECTED | WS_EVT_ERROR)) {
+                ws_connected = !!(bits & WS_EVT_CONNECTED);
+                break;
+            }
 
-        if (!(bits & WS_EVT_CONNECTED)) {
+            size_t got = 0;
+            i2s_channel_read(s_rx_chan, i2s_buf, I2S_READ_BYTES,
+                             &got, pdMS_TO_TICKS(200));
+            if (got == 0) continue;
+
+            // Downsample stereo→mono in-place (keep right channel)
+            int16_t *s = (int16_t *)i2s_buf;
+            size_t n_stereo = got / 2;
+            size_t n_mono   = n_stereo / 2;
+            for (size_t i = 0; i < n_mono; i++) {
+                s[i] = s[i * 2 + 1];
+            }
+            size_t mono_bytes = n_mono * 2;
+            size_t to_copy = mono_bytes;
+            if (prebuf_fill + to_copy > PREBUF_BYTES)
+                to_copy = PREBUF_BYTES - prebuf_fill;
+            memcpy(prebuf + prebuf_fill, i2s_buf, to_copy);
+            prebuf_fill += to_copy;
+        }
+
+        // If WS didn't connect during pre-buffer, wait a bit more
+        if (!ws_connected) {
+            bits = xEventGroupWaitBits(s_ws_events,
+                WS_EVT_CONNECTED | WS_EVT_ERROR,
+                pdTRUE, pdFALSE, pdMS_TO_TICKS(8000));
+            ws_connected = !!(bits & WS_EVT_CONNECTED);
+        }
+
+        if (!ws_connected) {
             ESP_LOGE(TAG, "WS connect failed");
+            i2s_rx_stop();
             esp_websocket_client_destroy(client);
             vEventGroupDelete(s_ws_events);
             xEventGroupClearBits(g_events, EVT_AUDIO_RECORDING);
@@ -331,29 +382,35 @@ static void record_task(void *arg)
             continue;
         }
 
-        // ── Send WAV header (max size — ffmpeg handles truncated data) ───────
+        ESP_LOGI(TAG, "WS connected, flushing %zu bytes pre-buffer", prebuf_fill);
+
+        // ── Send WAV header + flush pre-buffer ──────────────────────────────
         wav_hdr_t hdr;
         build_wav_header(&hdr, RECORD_MAX_S * SAMPLE_RATE * 2);
         esp_websocket_client_send_bin(client, (const char *)&hdr,
                                       sizeof(wav_hdr_t), pdMS_TO_TICKS(5000));
 
-        // ── Start I2S + mic ──────────────────────────────────────────────────
-        i2s_rx_start();
-        if (!s_mic_init) {
-            vTaskDelay(pdMS_TO_TICKS(50));
-            es7243e_init();
-            s_mic_init = true;
+        bool ws_ok = true;
+        size_t total_mono = 0;
+
+        // Flush pre-buffer
+        if (prebuf_fill > 0) {
+            int sent = esp_websocket_client_send_bin(client,
+                (const char *)prebuf, prebuf_fill, pdMS_TO_TICKS(5000));
+            if (sent < 0) {
+                ESP_LOGE(TAG, "WS send pre-buffer failed");
+                ws_ok = false;
+            }
+            total_mono += prebuf_fill;
         }
 
         display_set_state(DISPLAY_STATE_RECORDING, "Recording...\nRelease to stop");
         ESP_LOGI(TAG, "Streaming audio...");
 
         // ── Stream loop: read I2S → downsample → send via WS ────────────────
-        size_t total_mono = 0;
         size_t max_mono = RECORD_MAX_S * SAMPLE_RATE * 2;
-        bool ws_ok = true;
 
-        while (total_mono < max_mono) {
+        while (ws_ok && total_mono < max_mono) {
             if (!knob_btn_pressed()) break;
 
             size_t got = 0;
@@ -363,14 +420,13 @@ static void record_task(void *arg)
 
             // Downsample stereo→mono in-place (keep right channel)
             int16_t *s = (int16_t *)i2s_buf;
-            size_t n_stereo_samples = got / 2;   // total int16 samples
+            size_t n_stereo_samples = got / 2;
             size_t n_mono_samples   = n_stereo_samples / 2;
             for (size_t i = 0; i < n_mono_samples; i++) {
-                s[i] = s[i * 2 + 1];  // right channel
+                s[i] = s[i * 2 + 1];
             }
             size_t mono_bytes = n_mono_samples * 2;
 
-            // Send mono chunk via WebSocket
             int sent = esp_websocket_client_send_bin(client,
                 (const char *)i2s_buf, mono_bytes, pdMS_TO_TICKS(5000));
             if (sent < 0) {
@@ -386,7 +442,8 @@ static void record_task(void *arg)
         xEventGroupClearBits(g_events, EVT_AUDIO_RECORDING);
 
         float dur = (float)total_mono / (SAMPLE_RATE * 2);
-        ESP_LOGI(TAG, "Streamed %.1f s (%zu B mono)", dur, total_mono);
+        ESP_LOGI(TAG, "Streamed %.1f s (%zu B mono, %zu pre-buffered)",
+                 dur, total_mono, prebuf_fill);
 
         // Close WS — triggers server-side WAV→MP3 conversion + forwarding
         esp_websocket_client_close(client, pdMS_TO_TICKS(5000));
