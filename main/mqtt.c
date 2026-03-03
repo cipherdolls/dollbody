@@ -53,7 +53,6 @@ static void handle_action_event(const char *data, int data_len)
                         ESP_LOGW(TAG, "Recording in progress, skipping play %.36s", mid);
                     } else {
                         ESP_LOGI(TAG, "Audio message arrived: %.36s", mid);
-                        display_set_state(DISPLAY_STATE_PROCESSING, "New message!\nDownloading...");
                         audio_play_message(mid);
                     }
                 } else {

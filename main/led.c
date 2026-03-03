@@ -28,12 +28,28 @@ void led_task_fn(void *pvParameter)
 
     bool led_on = false;
     while (1) {
-        bool connected = (xEventGroupGetBits(g_events) & EVT_WIFI_GOT_IP) != 0;
-        if (connected) {
-            // Off when WiFi connected
-            led_strip_clear(strip);
+        EventBits_t bits = xEventGroupGetBits(g_events);
+        bool connected = (bits & EVT_WIFI_GOT_IP) != 0;
+        bool recording = (bits & EVT_AUDIO_RECORDING) != 0;
+        bool playing   = (bits & EVT_AUDIO_PLAYING) != 0;
+
+        if (recording) {
+            // Solid red while recording
+            led_strip_set_pixel(strip, 0, 30, 0, 0);
             led_strip_refresh(strip);
-            led_on = false;
+            led_on = true;
+        } else if (playing) {
+            // Solid blue while playing
+            led_strip_set_pixel(strip, 0, 0, 0, 30);
+            led_strip_refresh(strip);
+            led_on = true;
+        } else if (connected) {
+            // Off when idle + WiFi connected
+            if (led_on) {
+                led_strip_clear(strip);
+                led_strip_refresh(strip);
+                led_on = false;
+            }
         } else {
             // Blink orange when not connected
             led_on = !led_on;
@@ -44,6 +60,6 @@ void led_task_fn(void *pvParameter)
             }
             led_strip_refresh(strip);
         }
-        vTaskDelay(pdMS_TO_TICKS(500));
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }

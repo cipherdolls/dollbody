@@ -325,7 +325,6 @@ static void record_task(void *arg)
         }
 
         xEventGroupSetBits(g_events, EVT_AUDIO_RECORDING);
-        display_set_state(DISPLAY_STATE_RECORDING, "Recording...");
         audio_speaker_mute();
 
         // ── Start I2S + reader FIRST (pre-buffer while TLS handshakes) ──────
@@ -389,8 +388,6 @@ static void record_task(void *arg)
                     size_t prebuf = xStreamBufferBytesAvailable(s_ring_buf);
                     ESP_LOGI(TAG, "WS connected, %zu bytes pre-buffered (%.1f s)",
                              prebuf, (float)prebuf / (SAMPLE_RATE * 2));
-                    display_set_state(DISPLAY_STATE_RECORDING,
-                                      "Recording...\nRelease to stop");
                 }
             }
 
