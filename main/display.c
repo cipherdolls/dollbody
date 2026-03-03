@@ -33,8 +33,19 @@ static lv_obj_t *s_label = NULL;
 // Battery indicator (top of screen)
 static lv_obj_t *s_batt_label = NULL;
 
-// MQTT connection indicator (bottom of screen)
-static lv_obj_t *s_mqtt_label = NULL;
+// Bottom status panel: WiFi + MQTT in 2x2 grid
+static lv_obj_t *s_wifi_icon  = NULL;   // WiFi signal icon (top-left)
+static lv_obj_t *s_wifi_label = NULL;   // "WiFi" text (top-right)
+static lv_obj_t *s_mqtt_label = NULL;   // "MQTT" text (bottom-right)
+
+// Scenario image (full-screen background)
+static lv_obj_t *s_scenario_img = NULL;
+static lv_img_dsc_t s_scenario_dsc;
+
+// Avatar image (small overlay) + white ring behind it
+static lv_obj_t *s_avatar_ring = NULL;
+static lv_obj_t *s_avatar_img  = NULL;
+static lv_img_dsc_t s_avatar_dsc;
 
 // Traffic dots: TX (outgoing, left) and RX (incoming, right) below MQTT label
 static lv_obj_t *s_dot_tx = NULL;
@@ -293,8 +304,27 @@ void display_set_state(display_state_t state, const char *text)
     if (!display_lvgl_lock(100)) return;
 
     lv_obj_t *scr = lv_scr_act();
-    lv_obj_set_style_bg_color(scr, state_bg(state), 0);
-    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+
+    // Show scenario + avatar for WIFI_OK and PLAYING, hide for other states
+    bool show_images = (state == DISPLAY_STATE_WIFI_OK || state == DISPLAY_STATE_PLAYING);
+    bool has_images = (s_scenario_img || s_avatar_img);
+    if (has_images) {
+        if (show_images) {
+            if (s_scenario_img) lv_obj_clear_flag(s_scenario_img, LV_OBJ_FLAG_HIDDEN);
+            if (s_avatar_ring)  lv_obj_clear_flag(s_avatar_ring, LV_OBJ_FLAG_HIDDEN);
+            if (s_avatar_img)   lv_obj_clear_flag(s_avatar_img, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_bg_opa(scr, LV_OPA_TRANSP, 0);
+        } else {
+            if (s_scenario_img) lv_obj_add_flag(s_scenario_img, LV_OBJ_FLAG_HIDDEN);
+            if (s_avatar_ring)  lv_obj_add_flag(s_avatar_ring, LV_OBJ_FLAG_HIDDEN);
+            if (s_avatar_img)   lv_obj_add_flag(s_avatar_img, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_bg_color(scr, state_bg(state), 0);
+            lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+        }
+    } else {
+        lv_obj_set_style_bg_color(scr, state_bg(state), 0);
+        lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+    }
 
     if (!s_label) {
         s_label = lv_label_create(scr);
@@ -309,33 +339,89 @@ void display_set_state(display_state_t state, const char *text)
     display_lvgl_unlock();
 }
 
-void display_set_mqtt_connected(bool connected)
+// ── Bottom status panel helpers ───────────────────────────────────────────────
+
+// Anchor positions for the 2x2 grid in the bottom arc area
+#define STATUS_LEFT_X   175       // left column X (icons/dots)
+#define STATUS_RIGHT_X  215       // right column X (text)
+#define STATUS_ROW1_Y   (-38)     // top row Y offset from bottom
+#define STATUS_ROW2_Y   (-20)     // bottom row Y offset from bottom
+
+static void ensure_bottom_panel(void)
 {
-    if (!display_lvgl_lock(100)) return;
-
     lv_obj_t *scr = lv_scr_act();
-    if (!s_mqtt_label) {
-        s_mqtt_label = lv_label_create(scr);
-        lv_obj_align(s_mqtt_label, LV_ALIGN_BOTTOM_MID, 0, -48);
-        lv_obj_set_style_text_align(s_mqtt_label, LV_TEXT_ALIGN_CENTER, 0);
 
-        // Set text first so label has its real size before dots are aligned to it
-        lv_label_set_text(s_mqtt_label, LV_SYMBOL_WIFI " MQTT");
+    // Row 1 left: WiFi icon
+    if (!s_wifi_icon) {
+        s_wifi_icon = lv_label_create(scr);
+        lv_obj_set_pos(s_wifi_icon, STATUS_LEFT_X, LCD_V_RES + STATUS_ROW1_Y);
+        lv_obj_set_style_text_color(s_wifi_icon, lv_color_make(0x66, 0x66, 0x66), 0);
+        lv_label_set_text(s_wifi_icon, LV_SYMBOL_WIFI);
+    }
 
-        // TX dot (outgoing) — left, below the label
+    // Row 1 right: "WiFi" text
+    if (!s_wifi_label) {
+        s_wifi_label = lv_label_create(scr);
+        lv_obj_set_pos(s_wifi_label, STATUS_RIGHT_X, LCD_V_RES + STATUS_ROW1_Y);
+        lv_obj_set_style_text_color(s_wifi_label, lv_color_make(0x66, 0x66, 0x66), 0);
+        lv_label_set_text(s_wifi_label, "WiFi");
+    }
+
+    // Row 2 left: TX + RX dots
+    if (!s_dot_tx) {
         s_dot_tx = make_dot(scr);
-        lv_obj_align_to(s_dot_tx, s_mqtt_label, LV_ALIGN_OUT_BOTTOM_MID, -(DOT_SIZE + 2), 4);
+        lv_obj_set_pos(s_dot_tx, STATUS_LEFT_X, LCD_V_RES + STATUS_ROW2_Y);
 
-        // RX dot (incoming) — right, below the label
         s_dot_rx = make_dot(scr);
-        lv_obj_align_to(s_dot_rx, s_mqtt_label, LV_ALIGN_OUT_BOTTOM_MID, (DOT_SIZE + 2), 4);
+        lv_obj_set_pos(s_dot_rx, STATUS_LEFT_X + DOT_SIZE + 4, LCD_V_RES + STATUS_ROW2_Y);
 
-        // One-shot esp_timers to dim the dots after a pulse
         esp_timer_create_args_t ta = { .callback = dim_tx_cb, .name = "dot_tx" };
         esp_timer_create(&ta, &s_dim_timer_tx);
         esp_timer_create_args_t rb = { .callback = dim_rx_cb, .name = "dot_rx" };
         esp_timer_create(&rb, &s_dim_timer_rx);
     }
+
+    // Row 2 right: "MQTT" text
+    if (!s_mqtt_label) {
+        s_mqtt_label = lv_label_create(scr);
+        lv_obj_set_pos(s_mqtt_label, STATUS_RIGHT_X, LCD_V_RES + STATUS_ROW2_Y);
+        lv_obj_set_style_text_color(s_mqtt_label, lv_color_make(0x66, 0x66, 0x66), 0);
+        lv_label_set_text(s_mqtt_label, "MQTT");
+    }
+}
+
+void display_set_wifi_status(bool connected, int rssi)
+{
+    if (!display_lvgl_lock(100)) return;
+    ensure_bottom_panel();
+
+    // WiFi icon color based on signal strength
+    lv_color_t icon_col;
+    if (!connected) {
+        icon_col = lv_color_make(0x66, 0x66, 0x66);      // gray
+    } else if (rssi >= -50) {
+        icon_col = lv_color_make(0x00, 0xFF, 0x88);       // green (excellent)
+    } else if (rssi >= -65) {
+        icon_col = lv_color_make(0x88, 0xFF, 0x00);       // lime (good)
+    } else if (rssi >= -75) {
+        icon_col = lv_color_make(0xFF, 0xCC, 0x00);       // yellow (fair)
+    } else {
+        icon_col = lv_color_make(0xFF, 0x66, 0x33);       // orange (weak)
+    }
+    lv_obj_set_style_text_color(s_wifi_icon, icon_col, 0);
+
+    // "WiFi" label: green when connected, gray otherwise
+    lv_obj_set_style_text_color(s_wifi_label,
+        connected ? lv_color_make(0x00, 0xFF, 0x88)
+                  : lv_color_make(0x66, 0x66, 0x66), 0);
+
+    display_lvgl_unlock();
+}
+
+void display_set_mqtt_connected(bool connected)
+{
+    if (!display_lvgl_lock(100)) return;
+    ensure_bottom_panel();
 
     lv_obj_set_style_text_color(s_mqtt_label,
         connected ? lv_color_make(0x00, 0xFF, 0x88)
@@ -387,5 +473,104 @@ void display_set_battery(int percent, bool charging)
     else                   col = lv_color_make(0xFF, 0x33, 0x33);  // red
     lv_obj_set_style_text_color(s_batt_label, col, 0);
 
+    display_lvgl_unlock();
+}
+
+// Helper to enforce z-order: scenario (back) → avatar (middle) → text labels (front)
+static void enforce_z_order(void)
+{
+    if (s_scenario_img) lv_obj_move_background(s_scenario_img);
+    if (s_avatar_ring)  lv_obj_move_foreground(s_avatar_ring);
+    if (s_avatar_img)   lv_obj_move_foreground(s_avatar_img);
+    if (s_label)        lv_obj_move_foreground(s_label);
+    if (s_batt_label)   lv_obj_move_foreground(s_batt_label);
+    if (s_wifi_icon)    lv_obj_move_foreground(s_wifi_icon);
+    if (s_wifi_label)   lv_obj_move_foreground(s_wifi_label);
+    if (s_mqtt_label)   lv_obj_move_foreground(s_mqtt_label);
+    if (s_dot_tx)       lv_obj_move_foreground(s_dot_tx);
+    if (s_dot_rx)       lv_obj_move_foreground(s_dot_rx);
+}
+
+void display_set_scenario(uint16_t *rgb565, int w, int h)
+{
+    if (!rgb565 || w <= 0 || h <= 0) return;
+    if (!display_lvgl_lock(1000)) return;
+
+    // Set up image descriptor pointing to the PSRAM framebuffer
+    s_scenario_dsc.header.always_zero = 0;
+    s_scenario_dsc.header.w           = w;
+    s_scenario_dsc.header.h           = h;
+    s_scenario_dsc.header.cf          = LV_IMG_CF_TRUE_COLOR;
+    s_scenario_dsc.data_size          = w * h * sizeof(lv_color_t);
+    s_scenario_dsc.data               = (const uint8_t *)rgb565;
+
+    lv_obj_t *scr = lv_scr_act();
+
+    if (!s_scenario_img) {
+        s_scenario_img = lv_img_create(scr);
+    }
+    lv_img_set_src(s_scenario_img, &s_scenario_dsc);
+    lv_obj_align(s_scenario_img, LV_ALIGN_CENTER, 0, 0);
+
+    // Circular clip for round display
+    lv_obj_set_style_radius(s_scenario_img, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_clip_corner(s_scenario_img, true, 0);
+
+    enforce_z_order();
+
+    // Make the screen background transparent so the image shows through
+    lv_obj_set_style_bg_opa(scr, LV_OPA_TRANSP, 0);
+
+    ESP_LOGI(TAG, "Scenario image set (%dx%d)", w, h);
+    display_lvgl_unlock();
+}
+
+void display_set_avatar(uint16_t *rgb565, int w, int h)
+{
+    if (!rgb565 || w <= 0 || h <= 0) return;
+    if (!display_lvgl_lock(1000)) return;
+
+    // Set up image descriptor pointing to the PSRAM framebuffer
+    s_avatar_dsc.header.always_zero = 0;
+    s_avatar_dsc.header.w           = w;
+    s_avatar_dsc.header.h           = h;
+    s_avatar_dsc.header.cf          = LV_IMG_CF_TRUE_COLOR;
+    s_avatar_dsc.data_size          = w * h * sizeof(lv_color_t);
+    s_avatar_dsc.data               = (const uint8_t *)rgb565;
+
+    lv_obj_t *scr = lv_scr_act();
+
+    // Create white ring (slightly larger circle behind the avatar)
+    #define RING_PAD 3
+    if (!s_avatar_ring) {
+        s_avatar_ring = lv_obj_create(scr);
+        lv_obj_set_size(s_avatar_ring, w + RING_PAD * 2, h + RING_PAD * 2);
+        lv_obj_set_style_radius(s_avatar_ring, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(s_avatar_ring, lv_color_make(0xFF, 0xFF, 0xFF), 0);
+        lv_obj_set_style_bg_opa(s_avatar_ring, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(s_avatar_ring, 0, 0);
+        lv_obj_set_style_pad_all(s_avatar_ring, 0, 0);
+        lv_obj_clear_flag(s_avatar_ring, LV_OBJ_FLAG_SCROLLABLE);
+    }
+    lv_obj_align(s_avatar_ring, LV_ALIGN_BOTTOM_MID, 0, -50 + RING_PAD);
+
+    if (!s_avatar_img) {
+        s_avatar_img = lv_img_create(scr);
+    }
+    lv_img_set_src(s_avatar_img, &s_avatar_dsc);
+
+    // Position small avatar at bottom-center (inside the circular display area)
+    lv_obj_align(s_avatar_img, LV_ALIGN_BOTTOM_MID, 0, -50);
+
+    // Circular clip
+    lv_obj_set_style_radius(s_avatar_img, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_clip_corner(s_avatar_img, true, 0);
+
+    enforce_z_order();
+
+    // Make the screen background transparent so the image shows through
+    lv_obj_set_style_bg_opa(scr, LV_OPA_TRANSP, 0);
+
+    ESP_LOGI(TAG, "Avatar image set (%dx%d)", w, h);
     display_lvgl_unlock();
 }

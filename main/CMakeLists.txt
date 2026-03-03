@@ -13,11 +13,13 @@ idf_component_register(
          "audio.c"
          "record.c"
          "battery.c"
+         "avatar_img.c"
+         "scenario_img.c"
     INCLUDE_DIRS "."
     REQUIRES driver esp_psram esp_wifi nvs_flash esp_event esp_lcd
              esp_netif esp_timer freertos mqtt lwip
              espressif__led_strip esp_http_client json mbedtls
-             espressif__es8311 esp_adc
+             espressif__es8311 esp_adc esp_rom
 )
 
 # Re-run CMake whenever .env changes so new values are always picked up

@@ -1,4 +1,5 @@
 #include "wifi_mgr.h"
+#include "display.h"
 #include "events.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
@@ -17,11 +18,15 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
         ESP_LOGW(TAG, "Disconnected");
         xEventGroupClearBits(g_events, EVT_WIFI_CONNECTED | EVT_WIFI_GOT_IP);
         xEventGroupSetBits(g_events, EVT_WIFI_DISCONNECTED);
+        display_set_wifi_status(false, 0);
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&ev->ip_info.ip));
         xEventGroupClearBits(g_events, EVT_WIFI_DISCONNECTED);
         xEventGroupSetBits(g_events, EVT_WIFI_CONNECTED | EVT_WIFI_GOT_IP);
+        wifi_ap_record_t ap = {};
+        esp_wifi_sta_get_ap_info(&ap);
+        display_set_wifi_status(true, ap.rssi);
     }
 }
 

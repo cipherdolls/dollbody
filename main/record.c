@@ -247,14 +247,7 @@ static void ws_event_handler(void *arg, esp_event_base_t base,
 
 static void restore_idle_display(void)
 {
-    char msg[128];
-    if (strlen(g_config.chat_id) > 0) {
-        snprintf(msg, sizeof(msg), "Doll ID:\n%.36s\nChat ID:\n%.36s",
-                 g_config.doll_id, g_config.chat_id);
-    } else {
-        snprintf(msg, sizeof(msg), "Doll ID:\n%.36s\nNo chat linked",
-                 g_config.doll_id);
-    }
+    const char *msg = strlen(g_config.chat_id) > 0 ? "" : "No chat linked";
     display_set_state(DISPLAY_STATE_WIFI_OK, msg);
 }
 

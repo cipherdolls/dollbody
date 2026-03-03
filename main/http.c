@@ -2,6 +2,7 @@
 #include "config.h"
 #include "config_store.h"
 #include "display.h"
+#include "avatar_img.h"
 #include "events.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
@@ -18,7 +19,7 @@ static const char *TAG = "http";
 
 #define MAX_RETRIES    5
 #define RETRY_DELAY_MS 5000
-#define RESP_BUF_SIZE  1024
+#define RESP_BUF_SIZE  2048
 
 // ── HTTP response accumulator ─────────────────────────────────────────────────
 
@@ -80,12 +81,29 @@ static void show_chat_status(const char *resp_json)
     const char *cid = j ? cJSON_GetStringValue(cJSON_GetObjectItem(j, "chatId")) : NULL;
     if (cid && strlen(cid) > 0) {
         strlcpy(g_config.chat_id, cid, sizeof(g_config.chat_id));
-        snprintf(msg, sizeof(msg), "Doll ID:\n%.36s\nChat ID:\n%.36s",
-                 g_config.doll_id, cid);
+        msg[0] = '\0';
+
+        // Extract avatarId and scenarioId from nested chat object (requires ?include=chat)
+        cJSON *chat = j ? cJSON_GetObjectItem(j, "chat") : NULL;
+        const char *aid = chat ? cJSON_GetStringValue(cJSON_GetObjectItem(chat, "avatarId")) : NULL;
+        if (aid && strlen(aid) > 0) {
+            strlcpy(g_config.avatar_id, aid, sizeof(g_config.avatar_id));
+            ESP_LOGI(TAG, "Avatar ID: %s", g_config.avatar_id);
+        } else {
+            memset(g_config.avatar_id, 0, sizeof(g_config.avatar_id));
+        }
+        const char *sid = chat ? cJSON_GetStringValue(cJSON_GetObjectItem(chat, "scenarioId")) : NULL;
+        if (sid && strlen(sid) > 0) {
+            strlcpy(g_config.scenario_id, sid, sizeof(g_config.scenario_id));
+            ESP_LOGI(TAG, "Scenario ID: %s", g_config.scenario_id);
+        } else {
+            memset(g_config.scenario_id, 0, sizeof(g_config.scenario_id));
+        }
     } else {
         memset(g_config.chat_id, 0, sizeof(g_config.chat_id));
-        snprintf(msg, sizeof(msg), "Doll ID:\n%.36s\nNo chat linked",
-                 g_config.doll_id);
+        memset(g_config.avatar_id, 0, sizeof(g_config.avatar_id));
+        memset(g_config.scenario_id, 0, sizeof(g_config.scenario_id));
+        snprintf(msg, sizeof(msg), "No chat linked");
     }
     if (j) cJSON_Delete(j);
     display_set_state(DISPLAY_STATE_WIFI_OK, msg);
@@ -129,7 +147,7 @@ static void sync_task(void *arg)
         // If we already have a doll_id, verify it still exists on the backend
         if (strlen(g_config.doll_id) > 0) {
             display_set_state(DISPLAY_STATE_PROCESSING, "Checking API key...");
-            snprintf(url, sizeof(url), "%s/dolls/%s", g_config.server_url, g_config.doll_id);
+            snprintf(url, sizeof(url), "%s/dolls/%s?include=chat", g_config.server_url, g_config.doll_id);
             ESP_LOGI(TAG, "GET %s", url);
 
             status = http_get(url, auth, &resp);
@@ -143,6 +161,7 @@ static void sync_task(void *arg)
                 ESP_LOGI(TAG, "Doll verified: %s", g_config.doll_id);
                 show_chat_status(resp.buf);
                 xEventGroupSetBits(g_events, EVT_DOLL_READY);
+                avatar_img_start();
                 goto done;
             }
 
@@ -202,6 +221,7 @@ static void sync_task(void *arg)
                     ESP_LOGI(TAG, "Registered — doll_id=%s", g_config.doll_id);
                     show_chat_status(resp.buf);
                     xEventGroupSetBits(g_events, EVT_DOLL_READY);
+                    avatar_img_start();
                 }
                 cJSON_Delete(json);
             }
