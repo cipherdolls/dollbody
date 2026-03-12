@@ -1,10 +1,24 @@
 #include "led.h"
 #include "board.h"
 #include "events.h"
+#include "record.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "led_strip.h"
+
+// Map RMS (0–2000 typical speech range) to LED brightness (min–max).
+// Uses a square-root curve so quiet speech still shows movement.
+static uint8_t rms_to_brightness(uint16_t rms, uint8_t min_br, uint8_t max_br)
+{
+    if (rms == 0) return min_br;
+    // clamp to expected speech range
+    if (rms > 2000) rms = 2000;
+    // sqrt curve: maps 0–2000 → 0–1.0
+    float norm = __builtin_sqrtf((float)rms / 2000.0f);
+    uint8_t br = (uint8_t)(min_br + norm * (max_br - min_br));
+    return br;
+}
 
 void led_task_fn(void *pvParameter)
 {
@@ -45,13 +59,15 @@ void led_task_fn(void *pvParameter)
             }
             led_strip_refresh(strip);
         } else if (recording) {
-            // Bright red — recording / sending
-            led_strip_set_pixel(strip, 0, 30, 0, 0);
+            // Red pulsing with voice volume — min 8, max 30
+            uint8_t br = rms_to_brightness(g_audio_rms, 8, 30);
+            led_strip_set_pixel(strip, 0, br, 0, 0);
             led_strip_refresh(strip);
             led_on = true;
         } else if (playing) {
-            // Blue — playing response
-            led_strip_set_pixel(strip, 0, 0, 0, 30);
+            // Blue pulsing with playback volume — min 8, max 30
+            uint8_t br = rms_to_brightness(g_audio_rms, 8, 30);
+            led_strip_set_pixel(strip, 0, 0, 0, br);
             led_strip_refresh(strip);
             led_on = true;
         } else if (conv_mode && !conv_listening) {
@@ -60,8 +76,9 @@ void led_task_fn(void *pvParameter)
             led_strip_refresh(strip);
             led_on = true;
         } else if (conv_listening) {
-            // Very dim red — standby, listening for speech
-            led_strip_set_pixel(strip, 0, 5, 0, 0);
+            // Dim red pulsing with ambient level — min 3, max 12
+            uint8_t br = rms_to_brightness(g_audio_rms, 3, 12);
+            led_strip_set_pixel(strip, 0, br, 0, 0);
             led_strip_refresh(strip);
             led_on = true;
         } else {
@@ -72,6 +89,6 @@ void led_task_fn(void *pvParameter)
                 led_on = false;
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(50));  // 50 ms for responsive metering
     }
 }

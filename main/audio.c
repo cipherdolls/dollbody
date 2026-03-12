@@ -15,8 +15,10 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/stream_buffer.h"
+#include "record.h"
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 
 #define ES8311_ADDR         0x18  // ADDR pin low on SenseCAP Watcher
 #define I2S_MCLK_MULTIPLE   256   // matches I2S_STD_CLK_DEFAULT_CONFIG
@@ -26,6 +28,17 @@
 #include "minimp3.h"
 
 static const char *TAG = "audio";
+
+static void update_play_rms(const int16_t *pcm, int samples)
+{
+    if (samples <= 0) { g_audio_rms = 0; return; }
+    uint64_t sum_sq = 0;
+    for (int i = 0; i < samples; i++) {
+        int32_t v = pcm[i];
+        sum_sq += (uint64_t)(v * v);
+    }
+    g_audio_rms = (uint16_t)sqrtf((float)sum_sq / samples);
+}
 
 static i2s_chan_handle_t   s_tx_chan    = NULL;
 static QueueHandle_t      s_queue     = NULL;
@@ -219,6 +232,8 @@ static void stream_play_mp3(const char *message_id)
         int16_t *out   = s_pcm;
         size_t   bytes = (size_t)samples * info.channels * sizeof(int16_t);
 
+        update_play_rms(s_pcm, samples);
+
         if (info.channels == 1) {
             for (int i = 0; i < samples; i++) {
                 s_stereo[i * 2]     = s_pcm[i];
@@ -241,6 +256,7 @@ static void stream_play_mp3(const char *message_id)
         i2s_stop_ch();
     }
 
+    g_audio_rms = 0;
     xEventGroupClearBits(g_events, EVT_AUDIO_PLAYING);
 
     // Restore display
@@ -432,6 +448,8 @@ void audio_stream_play(StreamBufferHandle_t stream,
         int16_t *out   = s_pcm;
         size_t   bytes = (size_t)samples * info.channels * sizeof(int16_t);
 
+        update_play_rms(s_pcm, samples);
+
         if (info.channels == 1) {
             for (int i = 0; i < samples; i++) {
                 s_stereo[i * 2]     = s_pcm[i];
@@ -454,6 +472,7 @@ void audio_stream_play(StreamBufferHandle_t stream,
         i2s_stop_ch();
     }
 
+    g_audio_rms = 0;
     xEventGroupClearBits(g_events, EVT_AUDIO_PLAYING);
 
     const char *msg = strlen(g_config.chat_id) > 0 ? "" : "No chat linked";

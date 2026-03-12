@@ -22,6 +22,8 @@
 
 static const char *TAG = "record";
 
+volatile uint16_t g_audio_rms = 0;
+
 #define SAMPLE_RATE      16000
 #define RECORD_MAX_S     20
 #define I2S_READ_BYTES   2048           // stereo read buffer per iteration
@@ -369,8 +371,9 @@ static void i2s_reader_task(void *arg)
         }
         size_t mono_bytes = n_mono * 2;
 
-        // Compute RMS for VAD
+        // Compute RMS for VAD and LED level metering
         uint16_t rms = compute_rms(s, n_mono);
+        g_audio_rms = rms;
         bool loud = (rms > VAD_RMS_THRESHOLD);
 
         conv_state_t state = s_conv_state;
@@ -399,6 +402,7 @@ static void i2s_reader_task(void *arg)
         }
     }
 
+    g_audio_rms = 0;
     heap_caps_free(buf);
     ESP_LOGI(TAG, "I2S reader task exiting");
     vTaskDelete(NULL);
@@ -648,6 +652,7 @@ static bool conv_record_and_send(void)
     // If knob was pressed, signal caller to exit conversation mode
     if (knob_exit) {
         while (knob_btn_pressed()) vTaskDelay(pdMS_TO_TICKS(30));
+        xEventGroupClearBits(g_events, EVT_CONV_MODE);
         return false;
     }
 
