@@ -41,6 +41,7 @@ void led_task_fn(void *pvParameter)
     }
 
     bool led_on = false;
+    bool blink_phase = false;
     while (1) {
         EventBits_t bits = xEventGroupGetBits(g_events);
         bool connected      = (bits & EVT_WIFI_GOT_IP) != 0;
@@ -71,8 +72,13 @@ void led_task_fn(void *pvParameter)
             led_strip_refresh(strip);
             led_on = true;
         } else if (conv_mode && !conv_listening) {
-            // Medium red — waiting for server response
-            led_strip_set_pixel(strip, 0, 18, 0, 0);
+            // Blink white — waiting for server response
+            blink_phase = !blink_phase;
+            if (blink_phase) {
+                led_strip_set_pixel(strip, 0, 4, 4, 4);
+            } else {
+                led_strip_clear(strip);
+            }
             led_strip_refresh(strip);
             led_on = true;
         } else if (conv_listening) {
