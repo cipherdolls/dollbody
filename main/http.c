@@ -256,8 +256,8 @@ static StaticTask_t s_sync_tcb;
 
 void http_sync_doll(void)
 {
-    StackType_t *stack = heap_caps_malloc(8192, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    StackType_t *stack = heap_caps_malloc(16384, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     assert(stack);
     xTaskCreateStaticPinnedToCore(sync_task, "http_sync",
-        8192 / sizeof(StackType_t), NULL, 3, stack, &s_sync_tcb, 1);
+        16384 / sizeof(StackType_t), NULL, 3, stack, &s_sync_tcb, 1);
 }
