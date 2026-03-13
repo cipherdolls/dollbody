@@ -11,6 +11,7 @@
 #include "driver/uart.h"
 #include "esp_log.h"
 #include <string.h>
+#include <stdlib.h>
 
 static const char *TAG = "improv";
 
@@ -266,12 +267,23 @@ static void handle_serial_line(const char *line)
         } else {
             uart_write_bytes(UART_NUM, "ERR:APIKEY_EMPTY\n", 17);
         }
+    } else if (strncmp(line, "VOLUME:", 7) == 0) {
+        int vol = atoi(line + 7);
+        if (vol >= 0 && vol <= 100) {
+            g_config.speaker_volume = (uint8_t)vol;
+            config_store_save();
+            ESP_LOGI(TAG, "Volume set to %d via serial", vol);
+            uart_write_bytes(UART_NUM, "OK:VOLUME\n", 10);
+        } else {
+            uart_write_bytes(UART_NUM, "ERR:VOLUME_RANGE\n", 17);
+        }
     } else if (strcmp(line, "GETCONFIG") == 0) {
         char buf[256];
         int len = snprintf(buf, sizeof(buf),
-            "CONFIG:ssid=%s,apikey=%s,provisioned=%d,doll_body_id=%s,doll_id=%s\n",
+            "CONFIG:ssid=%s,apikey=%s,volume=%d,provisioned=%d,doll_body_id=%s,doll_id=%s\n",
             g_config.ssid,
             strlen(g_config.apikey) > 0 ? "***" : "",
+            g_config.speaker_volume,
             g_config.provisioned ? 1 : 0,
             g_config.doll_body_id,
             g_config.doll_id);

@@ -29,6 +29,7 @@ typedef struct {
     char stream_recorder_url[CONFIG_STREAM_REC_MAX];
     char stream_player_url[CONFIG_STREAM_PLAYER_MAX];
     bool provisioned;
+    uint8_t speaker_volume;  // 0–100, persisted in NVS
 } doll_config_t;
 
 extern doll_config_t g_config;

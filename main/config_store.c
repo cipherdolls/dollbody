@@ -21,6 +21,7 @@ esp_err_t config_store_load(void)
     strlcpy(g_config.stream_recorder_url, SECRET_STREAM_RECORDER_URL, sizeof(g_config.stream_recorder_url));
     strlcpy(g_config.stream_player_url,   SECRET_STREAM_PLAYER_URL,   sizeof(g_config.stream_player_url));
     g_config.doll_id[0] = '\0';
+    g_config.speaker_volume = 70;  // default volume
 
     // Override with NVS values if present (set by Improv or on-screen provisioning)
     nvs_handle_t h;
@@ -51,6 +52,11 @@ esp_err_t config_store_load(void)
         strlcpy(g_config.apikey, buf, sizeof(g_config.apikey));
     }
 
+    uint8_t vol;
+    if (nvs_get_u8(h, "volume", &vol) == ESP_OK) {
+        g_config.speaker_volume = vol;
+    }
+
     nvs_close(h);
 
     g_config.provisioned = (strlen(g_config.ssid) > 0);
@@ -66,6 +72,7 @@ esp_err_t config_store_save(void)
     nvs_set_str(h, "ssid",     g_config.ssid);
     nvs_set_str(h, "password", g_config.password);
     nvs_set_str(h, "apikey",   g_config.apikey);
+    nvs_set_u8(h, "volume",   g_config.speaker_volume);
     esp_err_t err = nvs_commit(h);
     nvs_close(h);
     ESP_LOGI(TAG, "Config saved: ssid='%s' doll_id='%s'", g_config.ssid, g_config.doll_id);
