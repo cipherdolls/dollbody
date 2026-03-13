@@ -20,6 +20,7 @@
 #include "record.h"
 #include "stream_player.h"
 #include "battery.h"
+#include "improv.h"
 
 static const char *TAG = "main";
 
@@ -49,6 +50,9 @@ void app_main(void)
 
     // WiFi init (always needed)
     wifi_mgr_init();
+
+    // Improv Wi-Fi Serial — always running so browser can provision via USB
+    xTaskCreate(improv_task_fn, "improv", 4096, NULL, 3, NULL);
 
     if (!g_config.provisioned || strlen(g_config.ssid) == 0) {
         // First boot — run provisioning flow

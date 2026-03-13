@@ -16,6 +16,7 @@ idf_component_register(
          "avatar_img.c"
          "scenario_img.c"
          "stream_player.c"
+         "improv.c"
     INCLUDE_DIRS "."
     REQUIRES driver esp_psram esp_wifi nvs_flash esp_event esp_lcd
              esp_netif esp_timer freertos mqtt lwip
