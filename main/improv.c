@@ -350,8 +350,14 @@ void improv_task_fn(void *pvParameter)
                     line_pos = 0;  // clear line buffer — this is Improv
                 }
             } else {
-                // Not Improv — accumulate into line buffer for custom commands
+                // Partial header match failed — flush matched bytes into line buffer
+                for (uint8_t i = 0; i < header_pos; i++) {
+                    if (line_pos < LINE_BUF_SIZE - 1) {
+                        line_buf[line_pos++] = (char)IMPROV_HEADER[i];
+                    }
+                }
                 header_pos = 0;
+                // Now handle the current byte
                 if (byte == '\n' || byte == '\r') {
                     if (line_pos > 0) {
                         line_buf[line_pos] = '\0';
