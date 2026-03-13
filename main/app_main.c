@@ -86,7 +86,7 @@ void app_main(void)
     }
 
     // Power management (deep sleep on inactivity)
-    xTaskCreate(power_task_fn, "power", 2048, NULL, 1, NULL);
+    xTaskCreate(power_task_fn, "power", 4096, NULL, 1, NULL);
 
     // Main loop — keep task alive
     while (1) {
