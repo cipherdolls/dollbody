@@ -4,6 +4,9 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
 #include <string.h>
 
 static const char *TAG = "config_store";
@@ -76,6 +79,27 @@ esp_err_t config_store_save(void)
     nvs_close(h);
     ESP_LOGI(TAG, "Config saved: ssid='%s' doll_id='%s'", g_config.ssid, g_config.doll_id);
     return err;
+}
+
+// NVS writes touch SPI flash which disables cache, making PSRAM inaccessible.
+// This wrapper spawns a short-lived task on internal RAM to do the save safely.
+static SemaphoreHandle_t s_save_sem;
+static esp_err_t s_save_result;
+
+static void save_task(void *arg)
+{
+    s_save_result = config_store_save();
+    xSemaphoreGive(s_save_sem);
+    vTaskDelete(NULL);
+}
+
+esp_err_t config_store_save_from_psram(void)
+{
+    s_save_sem = xSemaphoreCreateBinary();
+    xTaskCreate(save_task, "nvs_save", 4096, NULL, 5, NULL);
+    xSemaphoreTake(s_save_sem, portMAX_DELAY);
+    vSemaphoreDelete(s_save_sem);
+    return s_save_result;
 }
 
 esp_err_t config_store_clear(void)

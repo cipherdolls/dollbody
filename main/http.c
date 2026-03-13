@@ -219,7 +219,7 @@ static void sync_task(void *arg)
                 const char *id = cJSON_GetStringValue(cJSON_GetObjectItem(json, "id"));
                 if (id) {
                     strlcpy(g_config.doll_id, id, sizeof(g_config.doll_id));
-                    config_store_save();
+                    config_store_save_from_psram();
                     ESP_LOGI(TAG, "Registered — doll_id=%s", g_config.doll_id);
                     show_chat_status(resp.buf);
                     xEventGroupSetBits(g_events, EVT_DOLL_READY);
@@ -256,8 +256,8 @@ static StaticTask_t s_sync_tcb;
 
 void http_sync_doll(void)
 {
-    StackType_t *stack = heap_caps_malloc(16384, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    StackType_t *stack = heap_caps_malloc(8192, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     assert(stack);
     xTaskCreateStaticPinnedToCore(sync_task, "http_sync",
-        16384 / sizeof(StackType_t), NULL, 3, stack, &s_sync_tcb, 1);
+        8192 / sizeof(StackType_t), NULL, 3, stack, &s_sync_tcb, 1);
 }
